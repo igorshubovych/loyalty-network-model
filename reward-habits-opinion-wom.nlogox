@@ -1,6 +1,6 @@
-<?xml version='1.0' encoding='utf-8'?>
+<?xml version='1.0' encoding='UTF-8'?>
 <model version="NetLogo 7.0.4" snapToGrid="true">
-  <code><![CDATA[breed [shoppers shopper]
+  <code>breed [shoppers shopper]
 
 ;; =========================================================
 ;; MODEL DECLARATIONS
@@ -124,7 +124,7 @@ shoppers-own [
 ;;   Кількість бонусних кампаній.
 ;;   0 — бонусна програма не запускається;
 ;;   1 — одна кампанія;
-;;   >1 — повторні кампанії з паузами між ними.
+;;   &gt;1 — повторні кампанії з паузами між ними.
 ;;
 ;; reward-duration
 ;;   Тривалість активного бонусного періоду в одному циклі, у ticks.
@@ -300,7 +300,7 @@ end
 ;; модель або запускається з коректною конфігурацією, або одразу
 ;; повідомляє, яке саме обмеження порушено.
 to validate-configuration
-  if number-of-shoppers < 3 [
+  if number-of-shoppers &lt; 3 [
     error "number-of-shoppers must be at least 3"
   ]
 
@@ -308,7 +308,7 @@ to validate-configuration
     error "number-of-shoppers must be an integer"
   ]
 
-  if reward-cycles < 0 [
+  if reward-cycles &lt; 0 [
     error "reward-cycles cannot be negative"
   ]
 
@@ -316,35 +316,35 @@ to validate-configuration
     error "reward-cycles must be an integer"
   ]
 
-  if reward-cycles > 0 and reward-duration <= 0 [
-    error "reward-duration must be positive when reward-cycles > 0"
+  if reward-cycles &gt; 0 and reward-duration &lt;= 0 [
+    error "reward-duration must be positive when reward-cycles &gt; 0"
   ]
 
-  if withdrawal-duration <= 0 [
+  if withdrawal-duration &lt;= 0 [
     error "withdrawal-duration must be positive"
   ]
 
-  if low-reward-salience < 0 or low-reward-salience > 1 [
+  if low-reward-salience &lt; 0 or low-reward-salience &gt; 1 [
     error "low-reward-salience must be in the range [0, 1]"
   ]
 
-  if high-reward-salience < 0 or high-reward-salience > 1 [
+  if high-reward-salience &lt; 0 or high-reward-salience &gt; 1 [
     error "high-reward-salience must be in the range [0, 1]"
   ]
 
-  if low-reward-salience > high-reward-salience [
+  if low-reward-salience &gt; high-reward-salience [
     error "low-reward-salience cannot exceed high-reward-salience"
   ]
 
-  if network-degree < 2 [
+  if network-degree &lt; 2 [
     error "network-degree must be at least 2"
   ]
 
-  if network-degree >= number-of-shoppers [
+  if network-degree &gt;= number-of-shoppers [
     error "network-degree must be smaller than number-of-shoppers"
   ]
 
-  if rewiring-probability < 0 or rewiring-probability > 1 [
+  if rewiring-probability &lt; 0 or rewiring-probability &gt; 1 [
     error "rewiring-probability must be in the range [0, 1]"
   ]
 
@@ -414,7 +414,7 @@ to initialize-shopper-state
 
   ;; Початкова історія узгоджується з початковою силою звички.
   set recent-choice-history n-values habit-memory-window [
-    ifelse-value (random-float 1 < initial-habit) [1] [0]
+    ifelse-value (random-float 1 &lt; initial-habit) [1] [0]
   ]
   set habit mean recent-choice-history
 
@@ -454,20 +454,20 @@ end
 to setup-social-network
   ask links [ die ]
 
-  if network-topology = "ring-lattice" [
+  if network-topology = 1 [
     setup-ring-lattice
   ]
 
-  if network-topology = "small-world" [
+  if network-topology = 0 [
     setup-ring-lattice
     rewire-ring-lattice
   ]
 
-  if network-topology = "random" [
+  if network-topology = 2 [
     setup-random-network
   ]
 
-  if network-topology = "preferential-attachment" [
+  if network-topology = 3 [
     setup-preferential-attachment-network
   ]
 
@@ -483,7 +483,7 @@ to setup-ring-lattice
   let half-degree floor (network-degree / 2)
   ask shoppers [
     let source self
-    foreach (range 1 (half-degree + 1)) [ offset ->
+    foreach (range 1 (half-degree + 1)) [ offset -&gt;
       let target shopper (([who] of source + offset) mod count shoppers)
       if target != nobody and not link-neighbor? target [
         create-link-with target
@@ -497,7 +497,7 @@ end
 ;; імовірністю переносить один кінець до випадкового нового агента.
 to rewire-ring-lattice
   ask links [
-    if random-float 1 < rewiring-probability [
+    if random-float 1 &lt; rewiring-probability [
       let source end1
       let old-target end2
       let source-neighbors [link-neighbors] of source
@@ -518,7 +518,7 @@ end
 ;; що й ring-lattice. Дублікати та петлі не створюються.
 to setup-random-network
   let target-link-count floor (count shoppers * network-degree / 2)
-  while [count links < target-link-count] [
+  while [count links &lt; target-link-count] [
     let source one-of shoppers
     let candidates other shoppers with [not link-neighbor? source]
     if any? candidates [
@@ -537,16 +537,16 @@ to setup-preferential-attachment-network
   let seed sublist ordered 0 seed-size
 
   ;; Початкове ядро робимо зв'язним.
-  foreach seed [ a ->
-    foreach seed [ b ->
-      if [who] of a < [who] of b [
+  foreach seed [ a -&gt;
+    foreach seed [ b -&gt;
+      if [who] of a &lt; [who] of b [
         ask a [ create-link-with b ]
       ]
     ]
   ]
 
   let newcomers sublist ordered seed-size (length ordered)
-  foreach newcomers [ newcomer ->
+  foreach newcomers [ newcomer -&gt;
     let links-to-create min list attachment-count count shoppers with [self != newcomer]
     repeat links-to-create [
       let candidates shoppers with [
@@ -569,9 +569,9 @@ to-report weighted-degree-choice [candidate-set]
   let draw random-float total-weight
   let cumulative 0
 
-  foreach candidates [ candidate ->
+  foreach candidates [ candidate -&gt;
     set cumulative cumulative + [count link-neighbors + 1] of candidate
-    if draw <= cumulative [ report candidate ]
+    if draw &lt;= cumulative [ report candidate ]
   ]
 
   report last candidates
@@ -605,7 +605,7 @@ end
 
 
 to-report simulation-finished?
-  report ticks >= experiment-end
+  report ticks &gt;= experiment-end
 end
 
 
@@ -622,7 +622,7 @@ end
 ;; як саме винагорода впливає на рішення або психологічний стан агента.
 
 to-report experiment-end
-  if reward-cycles <= 0 [
+  if reward-cycles &lt;= 0 [
     report baseline-duration + withdrawal-duration
   ]
 
@@ -632,13 +632,13 @@ end
 
 
 to-report phase-at [time]
-  if time < baseline-duration [
+  if time &lt; baseline-duration [
     report "baseline"
   ]
 
   ;; reward-cycles = 0: після baseline виконується лише контрольний
   ;; період без бонусів.
-  if reward-cycles <= 0 [
+  if reward-cycles &lt;= 0 [
     report "withdrawal"
   ]
 
@@ -646,7 +646,7 @@ to-report phase-at [time]
   let cycle-length reward-duration + withdrawal-duration
   let position-in-cycle elapsed mod cycle-length
 
-  if position-in-cycle < reward-duration [
+  if position-in-cycle &lt; reward-duration [
     report "reward"
   ]
 
@@ -655,7 +655,7 @@ end
 
 
 to-report cycle-at [time]
-  if time < baseline-duration or reward-cycles <= 0 [
+  if time &lt; baseline-duration or reward-cycles &lt;= 0 [
     report 0
   ]
 
@@ -674,15 +674,15 @@ end
 ;; true лише для пауз між бонусними кампаніями.
 to-report inter-cycle-withdrawal?
   report current-phase = "withdrawal"
-    and reward-cycles > 1
-    and current-cycle < reward-cycles
+    and reward-cycles &gt; 1
+    and current-cycle &lt; reward-cycles
 end
 
 ;; true для періоду після останньої бонусної кампанії.
 ;; У сценарії без бонусів весь post-baseline період є фінальним контролем.
 to-report final-withdrawal?
   if current-phase != "withdrawal" [ report false ]
-  if reward-cycles <= 0 [ report true ]
+  if reward-cycles &lt;= 0 [ report true ]
   report current-cycle = reward-cycles
 end
 
@@ -711,7 +711,7 @@ end
 to choose-behavior
   ;; Utility визначає імовірність, а не жорсткий результат.
   set chose-target?
-    random-float 1 < target-choice-probability
+    random-float 1 &lt; target-choice-probability
 end
 
 
@@ -805,7 +805,7 @@ to update-intrinsic-motivation-state
 
   let salience active-reward-salience
 
-  ifelse salience <= salience-threshold [
+  ifelse salience &lt;= salience-threshold [
     apply-supportive-reward salience
   ]
   [
@@ -892,7 +892,7 @@ to perform-word-of-mouth-step
   ask shoppers [
     let talk-probability talk-propensity * abs opinion
 
-    if random-float 1 < talk-probability [
+    if random-float 1 &lt; talk-probability [
       set spoke-wom? true
       let message opinion
 
@@ -903,7 +903,7 @@ to perform-word-of-mouth-step
     ]
   ]
 
-  ask shoppers with [received-wom-count > 0] [
+  ask shoppers with [received-wom-count &gt; 0] [
     let social-signal received-wom / received-wom-count
     set opinion clamp
       (opinion + social-susceptibility * (social-signal - opinion))
@@ -1053,9 +1053,9 @@ end
 
 ;; Persistence Index compares post-reward persistence with the same
 ;; group's pre-reward baseline choice rate.
-;; > 0: behavior remains above baseline;
+;; &gt; 0: behavior remains above baseline;
 ;; = 0: behavior returns to baseline;
-;; < 0: behavior falls below baseline.
+;; &lt; 0: behavior falls below baseline.
 to-report persistence-index [group-name]
   report persistence group-name - choice-rate group-name "baseline"
 end
@@ -1273,7 +1273,7 @@ to-report behaviorsearch-fitness-no-crowding
        + 1.00 * motivation-penalty
        - 0.10 * policy-cost
 end
-]]></code>
+</code>
   <widgets>
     <view x="455" wrappingAllowedX="true" y="15" frameRate="30.0" minPycor="-16" height="515" showTickCounter="true" patchSize="15.5" fontSize="10" wrappingAllowedY="true" width="515" tickCounterLabel="ticks" maxPycor="16" updateMode="0" maxPxcor="16" minPxcor="-16"/>
     <button x="100" y="15" height="40" disableUntilTicks="false" forever="true" kind="Observer" width="55">go</button>
@@ -1396,15 +1396,15 @@ end
       <update/>
       <pen interval="1.0" mode="0" display="Control" color="-15575016" legend="true">
         <setup/>
-        <update><![CDATA[if final-withdrawal-ticks-completed > 0 [ plotxy ticks persistence "control" ]]]></update>
+        <update>if final-withdrawal-ticks-completed &gt; 0 [ plotxy ticks persistence "control" ]</update>
       </pen>
       <pen interval="1.0" mode="0" display="Low salience" color="-11221820" legend="true">
         <setup/>
-        <update><![CDATA[if final-withdrawal-ticks-completed > 0 [ plotxy ticks persistence "low-salience" ]]]></update>
+        <update>if final-withdrawal-ticks-completed &gt; 0 [ plotxy ticks persistence "low-salience" ]</update>
       </pen>
       <pen interval="1.0" mode="0" display="High salience" color="-2674135" legend="true">
         <setup/>
-        <update><![CDATA[if final-withdrawal-ticks-completed > 0 [ plotxy ticks persistence "high-salience" ]]]></update>
+        <update>if final-withdrawal-ticks-completed &gt; 0 [ plotxy ticks persistence "high-salience" ]</update>
       </pen>
     </plot>
     <plot x="1385" autoPlotX="true" yMax="0.5" autoPlotY="false" y="290" xMin="0.0" height="395" legend="true" xMax="160.0" yMin="-0.5" width="390" display="Persistence Index">
@@ -1412,22 +1412,22 @@ end
       <update/>
       <pen interval="1.0" mode="0" display="Control" color="-15575016" legend="true">
         <setup/>
-        <update><![CDATA[if final-withdrawal-ticks-completed > 0 [ plotxy ticks persistence-index "control" ]]]></update>
+        <update>if final-withdrawal-ticks-completed &gt; 0 [ plotxy ticks persistence-index "control" ]</update>
       </pen>
       <pen interval="1.0" mode="0" display="Low salience" color="-11221820" legend="true">
         <setup/>
-        <update><![CDATA[if final-withdrawal-ticks-completed > 0 [ plotxy ticks persistence-index "low-salience" ]]]></update>
+        <update>if final-withdrawal-ticks-completed &gt; 0 [ plotxy ticks persistence-index "low-salience" ]</update>
       </pen>
       <pen interval="1.0" mode="0" display="High salience" color="-2674135" legend="true">
         <setup/>
-        <update><![CDATA[if final-withdrawal-ticks-completed > 0 [ plotxy ticks persistence-index "high-salience" ]]]></update>
+        <update>if final-withdrawal-ticks-completed &gt; 0 [ plotxy ticks persistence-index "high-salience" ]</update>
       </pen>
       <pen interval="1.0" mode="0" display="Zero reference" color="-7500403" legend="false">
         <setup/>
-        <update><![CDATA[if final-withdrawal-ticks-completed > 0 [ plotxy ticks 0 ]]]></update>
+        <update>if final-withdrawal-ticks-completed &gt; 0 [ plotxy ticks 0 ]</update>
       </pen>
     </plot>
-  <note x="455" y="545" width="240" height="25" fontSize="12" markdown="false" backgroundLight="0" backgroundDark="0" textColorLight="-16777216" textColorDark="-1">Social network and WOM</note><switch x="455" y="580" width="130" height="35" display="wom-on?" variable="wom-on?" on="true" sizeVersion="0"/><switch x="600" y="580" width="150" height="35" display="show-network?" variable="show-network?" on="true" sizeVersion="0"/><chooser x="455" y="625" width="220" height="55" display="network-topology" variable="network-topology" current="0" sizeVersion="0"><choice value="&quot;small-world&quot;"/><choice value="&quot;ring-lattice&quot;"/><choice value="&quot;random&quot;"/><choice value="&quot;preferential-attachment&quot;"/></chooser><slider x="690" y="625" width="180" height="33" display="network-degree" variable="network-degree" min="2" max="20" step="2" default="6.0" direction="Horizontal" sizeVersion="0"/><slider x="690" y="670" width="180" height="33" display="rewiring-probability" variable="rewiring-probability" min="0" max="1" step="0.05" default="0.1" direction="Horizontal" sizeVersion="0"/><monitor x="455" y="690" width="205" height="55" fontSize="11" precision="3" display="WOM speaker share">wom-speaker-share</monitor><monitor x="675" y="710" width="195" height="55" fontSize="11" precision="2" display="Mean network degree">mean-network-degree</monitor><plot x="1385" y="700" width="390" height="220" display="Mean Satisfaction" xMin="0.0" xMax="160.0" yMin="-1.0" yMax="1.0" autoPlotX="true" autoPlotY="false" legend="true"><setup/><update/><pen display="Control" interval="1.0" mode="0" color="-10899396" legend="true"><setup/><update>plot mean-satisfaction "control"</update></pen><pen display="Low salience" interval="1.0" mode="0" color="-11221820" legend="true"><setup/><update>plot mean-satisfaction "low-salience"</update></pen><pen display="High salience" interval="1.0" mode="0" color="-2674135" legend="true"><setup/><update>plot mean-satisfaction "high-salience"</update></pen></plot><plot x="1385" y="930" width="390" height="220" display="Mean Opinion" xMin="0.0" xMax="160.0" yMin="-1.0" yMax="1.0" autoPlotX="true" autoPlotY="false" legend="true"><setup/><update/><pen display="Control" interval="1.0" mode="0" color="-10899396" legend="true"><setup/><update>plot mean-opinion "control"</update></pen><pen display="Low salience" interval="1.0" mode="0" color="-11221820" legend="true"><setup/><update>plot mean-opinion "low-salience"</update></pen><pen display="High salience" interval="1.0" mode="0" color="-2674135" legend="true"><setup/><update>plot mean-opinion "high-salience"</update></pen></plot></widgets>
+  <note x="455" y="545" width="240" height="25" fontSize="12" markdown="false" backgroundLight="0" backgroundDark="0" textColorLight="-16777216" textColorDark="-1">Social network and WOM</note><switch x="455" y="580" width="130" height="35" display="wom-on?" variable="wom-on?" on="true" sizeVersion="0"/><switch x="600" y="580" width="150" height="35" display="show-network?" variable="show-network?" on="true" sizeVersion="0"/><slider x="455" y="625" width="220" height="33" display="network-topology" variable="network-topology" min="0" max="3" step="1" default="0.0" direction="Horizontal" sizeVersion="0"/><slider x="690" y="625" width="180" height="33" display="network-degree" variable="network-degree" min="2" max="20" step="2" default="6.0" direction="Horizontal" sizeVersion="0"/><slider x="690" y="670" width="180" height="33" display="rewiring-probability" variable="rewiring-probability" min="0" max="1" step="0.05" default="0.1" direction="Horizontal" sizeVersion="0"/><monitor x="455" y="690" width="205" height="55" fontSize="11" precision="3" display="WOM speaker share">wom-speaker-share</monitor><monitor x="675" y="710" width="195" height="55" fontSize="11" precision="2" display="Mean network degree">mean-network-degree</monitor><plot x="1385" y="700" width="390" height="220" display="Mean Satisfaction" xMin="0.0" xMax="160.0" yMin="-1.0" yMax="1.0" autoPlotX="true" autoPlotY="false" legend="true"><setup/><update/><pen display="Control" interval="1.0" mode="0" color="-10899396" legend="true"><setup/><update>plot mean-satisfaction "control"</update></pen><pen display="Low salience" interval="1.0" mode="0" color="-11221820" legend="true"><setup/><update>plot mean-satisfaction "low-salience"</update></pen><pen display="High salience" interval="1.0" mode="0" color="-2674135" legend="true"><setup/><update>plot mean-satisfaction "high-salience"</update></pen></plot><plot x="1385" y="930" width="390" height="220" display="Mean Opinion" xMin="0.0" xMax="160.0" yMin="-1.0" yMax="1.0" autoPlotX="true" autoPlotY="false" legend="true"><setup/><update/><pen display="Control" interval="1.0" mode="0" color="-10899396" legend="true"><setup/><update>plot mean-opinion "control"</update></pen><pen display="Low salience" interval="1.0" mode="0" color="-11221820" legend="true"><setup/><update>plot mean-opinion "low-salience"</update></pen><pen display="High salience" interval="1.0" mode="0" color="-2674135" legend="true"><setup/><update>plot mean-opinion "high-salience"</update></pen></plot></widgets>
   <info># Агентна модель програм лояльності, satisfaction, opinion і WOM
 
 ## Призначення
@@ -1449,7 +1449,7 @@ end
 
 ## Соціальна мережа
 
-У chooser `network-topology` доступні:
+Слайдер `network-topology` задає тип мережі числовим кодом:
 
 - `small-world` — регулярне кільце з випадковим перепідключенням;
 - `ring-lattice` — локальна регулярна мережа;
@@ -2435,7 +2435,7 @@ All experiments use 30 repetitions per configuration and record behavior, motiva
       <setup>random-seed 12345
 setup</setup>
       <go>go</go>
-      <exitCondition><![CDATA[ticks >= experiment-end]]></exitCondition>
+      <exitCondition>ticks &gt;= experiment-end</exitCondition>
       <metrics>
         <metric>high-reward-crowding-out-effect</metric>
         <metric>low-reward-persistence-effect</metric>
