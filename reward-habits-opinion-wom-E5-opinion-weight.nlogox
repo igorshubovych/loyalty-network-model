@@ -1,0 +1,2762 @@
+<?xml version="1.0" encoding="utf-8"?>
+<model version="NetLogo 7.0.4" snapToGrid="true">
+  <code><![CDATA[extensions [nw]
+
+breed [shoppers shopper]
+
+;; =========================================================
+;; MODEL DECLARATIONS
+;; =========================================================
+;;
+;; Модель розділена на незалежні логічні модулі:
+;; 1) Simulation Controller — керує послідовністю виконання;
+;; 2) Reward Schedule Module — визначає активність бонусної програми;
+;; 3) Shopper Decision Module — обчислює імовірність вибору;
+;; 4) Behavioral State Module — оновлює звичку та мотивацію;
+;; 5) Experience and Opinion Module — формує satisfaction та opinion;
+;; 6) Network and WOM Module — створює мережу та передає думки;
+;; 7) Metrics Module — накопичує й повертає результати;
+;; 8) Visualization Module — відображає стан агентів.
+;;
+;; Така структура дозволяє замінювати або додавати поведінкові
+;; механізми без переписування основного циклу симуляції.
+
+globals [
+  ;; Поточний режим програми лояльності:
+  ;; "baseline"   — початкове спостереження без бонусів;
+  ;; "reward"     — бонусна програма активна;
+  ;; "withdrawal" — бонусна програма призупинена або завершена.
+  current-phase
+
+  ;; Номер поточного бонусного циклу.
+  ;; 0 означає baseline або сценарій без бонусної програми.
+  current-cycle
+
+  ;; Кількість виконаних ticks кожного типу фази.
+  ;; Withdrawal розділено на паузи між кампаніями та фінальний період
+  ;; після завершення всієї програми. Ці лічильники глобальні, оскільки
+  ;; кожний shopper має рівно одну можливість вибору на кожному tick.
+  baseline-ticks-completed
+  reward-ticks-completed
+  inter-cycle-withdrawal-ticks-completed
+  final-withdrawal-ticks-completed
+
+  ;; Constants
+  baseline-duration
+  habit-memory-window
+  salience-threshold
+  target-choice-cost
+]
+
+
+shoppers-own [
+  ;; Експериментальна група:
+  ;; "control", "low-salience" або "high-salience".
+  treatment-group
+
+  ;; Внутрішня мотивація [0; 1].
+  ;; Відображає внутрішню цінність цільової поведінки для покупця,
+  ;; незалежно від зовнішньої винагороди.
+  intrinsic-motivation
+
+  ;; Сила звички [0; 1], обчислена як частка цільових виборів
+  ;; у скінченному вікні нещодавньої поведінки.
+  habit
+
+  ;; Сталі індивідуальні характеристики агента.
+  ;; Вони генеруються під час setup і не задаються через UI.
+  price-sensitivity
+  habit-sensitivity
+  reward-sensitivity
+
+  ;; Чутливість до втрати автономії [0; 1]: наскільки сильно агент
+  ;; сприймає надмірно значущу винагороду як зовнішній контроль.
+  autonomy-sensitivity
+
+  ;; Історія останніх виборів: 1 — цільовий вибір, 0 — альтернативний.
+  recent-choice-history
+
+  ;; Результат вибору на поточному tick.
+  ;; true — цільовий сталий/здоровий варіант обрано.
+  chose-target?
+
+  ;; Оцінка останньої взаємодії [-1; 1]. Satisfaction є миттєвим
+  ;; результатом конкретної покупки та не накопичує історію самостійно.
+  satisfaction
+
+  ;; Накопичене ставлення до цільового вибору / програми [-1; 1].
+  ;; Воно формується власним досвідом і повідомленнями сусідів.
+  opinion
+
+  ;; Сталі індивідуальні характеристики соціальної поведінки [0; 1].
+  ;; opinion-update-rate — чутливість до нового власного досвіду;
+  ;; social-susceptibility — схильність довіряти рекомендаціям;
+  ;; talk-propensity — базова готовність ділитися думкою.
+  opinion-update-rate
+  social-susceptibility
+  talk-propensity
+
+  ;; Тимчасові змінні WOM. Вони скидаються на початку кожного tick.
+  received-wom
+  received-wom-count
+  spoke-wom?
+
+  ;; Фактична зміна opinion, спричинена WOM на поточному tick.
+  ;; Використовується лише для діагностики соціального механізму.
+  wom-opinion-change
+
+  ;; Кількість цільових виборів у кожному типі фази.
+  ;; Reward агрегується за всі активні кампанії, а withdrawal окремо
+  ;; зберігається для проміжних пауз і фінального спостереження.
+  baseline-target-choices
+  reward-target-choices
+  inter-cycle-withdrawal-target-choices
+  final-withdrawal-target-choices
+]
+
+
+;; =========================================================
+;; UI PARAMETERS: SEMANTIC / BEHAVIORAL MEANING
+;; =========================================================
+;;
+;; Вхідні параметри утворюють п'ять конфігураційних груп.
+;; Така класифікація відокремлює технічний масштаб симуляції,
+;; розклад бонусної програми, політику винагороди та поведінкові
+;; припущення конкретної моделі агентів та соціальну мережу.
+;;
+;; SIMULATION CONFIGURATION
+;;
+;; number-of-shoppers
+;;   Розмір модельованої популяції. Збільшення значення зменшує
+;;   випадкові коливання агрегованих показників, але збільшує час роботи.
+;;
+;; REWARD SCHEDULE CONFIGURATION
+;;
+;; reward-cycles
+;;   Кількість бонусних кампаній.
+;;   0 — бонусна програма не запускається;
+;;   1 — одна кампанія;
+;;   >1 — повторні кампанії з паузами між ними.
+;;
+;; reward-duration
+;;   Тривалість активного бонусного періоду в одному циклі, у ticks.
+;;   Один tick інтерпретується як одна можливість здійснити вибір.
+;;
+;; withdrawal-duration
+;;   Тривалість періоду без бонусів після кожної кампанії, у ticks.
+;;   Між циклами це пауза, а після останнього циклу — фінальний період
+;;   спостереження за стійкістю поведінки.
+;;
+;; REWARD POLICY CONFIGURATION
+;;
+;; low-reward-salience / high-reward-salience
+;;   Психологічна значущість (reward salience), а не номінальна сума
+;;   винагороди. Значення визначає, наскільки зовнішній стимул помітний
+;;   у процесі прийняття рішення. Параметри задають політику винагороди
+;;   для двох treatment-груп.
+;;
+;; BEHAVIORAL MODEL CONFIGURATION
+;;
+;; Індивідуальні властивості shopper не задаються через UI. Під час
+;; setup для кожного агента генеруються price-sensitivity,
+;; habit-sensitivity, reward-sensitivity та autonomy-sensitivity.
+;; Звичка визначається історією повторень, тому окремий
+;; habit-learning-rate не використовується. Ерозія внутрішньої
+;; мотивації визначається значущістю винагороди та індивідуальною
+;; autonomy-sensitivity, тому crowding-out-rate також не потрібний.
+
+;; =========================================================
+;; MODEL CONSTANTS
+;; =========================================================
+;; Іменовані reporters нижче є незмінними припущеннями конкретної
+;; реалізації моделі. Вони не є динамічним станом і не задаються в UI.
+
+;; Кількість останніх можливостей вибору, що визначають поточну звичку.
+;; Це інтерпретований горизонт поведінкової пам'яті, а не швидкість навчання.
+;; Параметри розподілів індивідуальних властивостей shopper.
+;; Середні значення habit/reward sensitivity зберігають масштаб впливів
+;; попередньої версії моделі, але тепер агенти є неоднорідними.
+
+;; =========================================================
+;; SETUP
+;; =========================================================
+
+to initialize-constants
+  set baseline-duration 30
+  set habit-memory-window 20
+  set salience-threshold 0.60
+  set target-choice-cost 1.50
+end
+
+
+to setup
+  clear-all
+  initialize-constants
+  no-display
+
+  ;; Перевірка контракту вхідної конфігурації виконується до створення
+  ;; агентів. Некоректний сценарій завершується з пояснювальною помилкою.
+  validate-configuration
+
+  initialize-system-state
+
+  ;; NW одночасно створює агентів і зв'язки потрібної топології.
+  ;; Це усуває окремий повільний етап ручного створення links.
+  setup-social-network
+
+  reset-ticks
+  update-simulation-state
+  update-visualization
+  display
+end
+
+
+;; Перевіряє семантичні обмеження UI та BehaviourSpace-параметрів.
+;; Валідація є частиною зовнішнього контракту симуляційного ядра:
+;; модель або запускається з коректною конфігурацією, або одразу
+;; повідомляє, яке саме обмеження порушено.
+to validate-configuration
+  if opinion-weight < 0 [
+    error "opinion-weight must be non-negative."
+  ]
+
+  if number-of-shoppers < 3 [
+    error "number-of-shoppers must be at least 3"
+  ]
+
+  if number-of-shoppers != floor number-of-shoppers [
+    error "number-of-shoppers must be an integer"
+  ]
+
+  if reward-cycles < 0 [
+    error "reward-cycles cannot be negative"
+  ]
+
+  if reward-cycles != floor reward-cycles [
+    error "reward-cycles must be an integer"
+  ]
+
+  if reward-cycles > 0 and reward-duration <= 0 [
+    error "reward-duration must be positive when reward-cycles > 0"
+  ]
+
+  if withdrawal-duration <= 0 [
+    error "withdrawal-duration must be positive"
+  ]
+
+  if low-reward-salience < 0 or low-reward-salience > 1 [
+    error "low-reward-salience must be in the range [0, 1]"
+  ]
+
+  if high-reward-salience < 0 or high-reward-salience > 1 [
+    error "high-reward-salience must be in the range [0, 1]"
+  ]
+
+  if low-reward-salience > high-reward-salience [
+    error "low-reward-salience cannot exceed high-reward-salience"
+  ]
+
+  if network-degree < 2 [
+    error "network-degree must be at least 2"
+  ]
+
+  if network-degree >= number-of-shoppers [
+    error "network-degree must be smaller than number-of-shoppers"
+  ]
+
+  if rewiring-probability < 0 or rewiring-probability > 1 [
+    error "rewiring-probability must be in the range [0, 1]"
+  ]
+
+  if not member? purchase-deliberation-mode ["low-involvement" "high-involvement"] [
+    error "purchase-deliberation-mode must be low-involvement or high-involvement"
+  ]
+
+  if confidence-bound <= 0 or confidence-bound > 2 [
+    error "confidence-bound must be in the range (0, 2]"
+  ]
+
+end
+
+to initialize-system-state
+  set baseline-ticks-completed 0
+  set reward-ticks-completed 0
+  set inter-cycle-withdrawal-ticks-completed 0
+  set final-withdrawal-ticks-completed 0
+end
+
+to initialize-shopper-state
+  set shape "person"
+  set size 0.7
+
+  ;; Обрізані нормальні розподіли створюють гетерогенну популяцію,
+  ;; зберігаючи значення психологічних станів у діапазоні [0; 1].
+  set intrinsic-motivation bounded-random-normal 0.5 0.15 0 1
+
+  let initial-habit bounded-random-normal 0.2 0.1 0 1
+
+  ;; Поведінкові характеристики генеруються з обрізаних нормальних
+  ;; розподілів. Це уникає надмірної кількості крайніх типів агентів.
+  set price-sensitivity bounded-random-normal 1 0.25 0.5 1.5
+  set habit-sensitivity bounded-random-normal 1.5 0.25 0.75 2.25
+  set reward-sensitivity bounded-random-normal 2 0.25 1 3
+  set autonomy-sensitivity bounded-random-normal 0.5 0.2 0 1
+
+  ;; Початковий satisfaction майже нейтральний, а opinion містить
+  ;; невеликий випадковий розкид. Надалі satisfaction замінюється
+  ;; після кожної покупки, тоді як opinion накопичує досвід.
+  set satisfaction bounded-random-normal 0 0.10 -1 1
+  set opinion bounded-random-normal 0 0.15 -1 1
+  set opinion-update-rate bounded-random-normal 0.25 0.1 0.05 0.80
+  set social-susceptibility bounded-random-normal 0.35 0.15 0 1
+  set talk-propensity bounded-random-normal 0.65 0.15 0 1
+
+  set received-wom 0
+  set received-wom-count 0
+  set spoke-wom? false
+  set wom-opinion-change 0
+
+  ;; Початкова історія узгоджується з початковою силою звички.
+  set recent-choice-history n-values habit-memory-window [
+    ifelse-value (random-float 1 < initial-habit) [1] [0]
+  ]
+  set habit mean recent-choice-history
+
+  set chose-target? false
+  set baseline-target-choices 0
+  set reward-target-choices 0
+  set inter-cycle-withdrawal-target-choices 0
+  set final-withdrawal-target-choices 0
+end
+
+
+to assign-treatment-group
+  ;; Детермінований розподіл забезпечує майже однаковий розмір груп.
+  if who mod 3 = 0 [
+    set treatment-group "control"
+    set color (lime - 3)
+  ]
+
+  if who mod 3 = 1 [
+    set treatment-group "low-salience"
+    set color cyan
+  ]
+
+  if who mod 3 = 2 [
+    set treatment-group "high-salience"
+    set color red
+  ]
+end
+
+
+;; =========================================================
+;; NETWORK MODULE
+;; =========================================================
+;; Соціальна мережа є статичною в межах одного запуску.
+;; Її топологію створюють стандартні генератори розширення NW.
+;; Це скорочує код, гарантує відповідність відомим алгоритмам
+;; і пришвидшує setup порівняно з поетапним створенням links.
+
+to setup-social-network
+  ;; Захист від некоректного значення після відкриття старішої версії.
+  if not member? network-topology
+    ["small-world" "ring-lattice" "random" "preferential-attachment"] [
+    set network-topology "small-world"
+  ]
+
+  ;; Для Watts–Strogatz neighborhood-size означає кількість сусідів
+  ;; з кожного боку кільця. Очікуваний degree дорівнює 2k.
+  let neighborhood-size max list 1 floor (network-degree / 2)
+
+  if network-topology = "ring-lattice" [
+    ;; Регулярна кільцева ґратка: Watts–Strogatz без перепідключення.
+    nw:generate-watts-strogatz
+      shoppers links number-of-shoppers neighborhood-size 0
+      [ initialize-generated-shopper ]
+  ]
+
+  if network-topology = "small-world" [
+    ;; Класична small-world топологія Watts–Strogatz.
+    nw:generate-watts-strogatz
+      shoppers links number-of-shoppers neighborhood-size rewiring-probability
+      [ initialize-generated-shopper ]
+  ]
+
+  if network-topology = "random" [
+    ;; Erdős–Rényi G(n,p). p підібрано так, щоб очікуваний
+    ;; середній degree приблизно дорівнював network-degree.
+    let connection-probability
+      min list 1 (network-degree / (number-of-shoppers - 1))
+
+    nw:generate-random
+      shoppers links number-of-shoppers connection-probability
+      [ initialize-generated-shopper ]
+  ]
+
+  if network-topology = "preferential-attachment" [
+    ;; Barabási–Albert. Середній degree приблизно дорівнює 2m.
+    let minimum-degree max list 1 floor (network-degree / 2)
+
+    nw:generate-preferential-attachment
+      shoppers links number-of-shoppers minimum-degree
+      [ initialize-generated-shopper ]
+  ]
+
+  ;; Явний контекст потрібен для подальших NW-метрик та аналізу.
+  nw:set-context shoppers links
+
+  ;; Розміщення впливає лише на вигляд, а не на WOM.
+  layout-circle shoppers (max-pxcor - 1)
+  ask links [ set hidden? not show-network? ]
+end
+
+
+;; NW виконує цей блок для кожного щойно створеного агента.
+to initialize-generated-shopper
+  initialize-shopper-state
+  assign-treatment-group
+end
+
+
+;; =========================================================
+;; SIMULATION CONTROLLER
+;; =========================================================
+;; Верхньорівневий алгоритм не містить поведінкових формул.
+;; Він лише координує виклик незалежних модулів.
+
+to go
+  if simulation-finished? [ stop ]
+
+  update-simulation-state
+
+  ;; Усі агенти спочатку завершують вибір і оновлення власного стану.
+  ;; Лише після цього виконується WOM, щоб результат не залежав від
+  ;; випадкового порядку агентів усередині ask.
+  ask shoppers [
+    perform-shopper-step
+  ]
+
+  perform-word-of-mouth-step
+
+  record-system-state
+  update-visualization
+  tick
+end
+
+
+to-report simulation-finished?
+  report ticks >= experiment-end
+end
+
+
+to update-simulation-state
+  set current-phase phase-at ticks
+  set current-cycle cycle-at ticks
+end
+
+
+;; =========================================================
+;; REWARD SCHEDULE MODULE
+;; =========================================================
+;; Модуль визначає лише часову структуру програми. Він не знає,
+;; як саме винагорода впливає на рішення або психологічний стан агента.
+
+to-report experiment-end
+  if reward-cycles <= 0 [
+    report baseline-duration + withdrawal-duration
+  ]
+
+  report baseline-duration
+    + reward-cycles * (reward-duration + withdrawal-duration)
+end
+
+
+to-report phase-at [time]
+  if time < baseline-duration [
+    report "baseline"
+  ]
+
+  ;; reward-cycles = 0: після baseline виконується лише контрольний
+  ;; період без бонусів.
+  if reward-cycles <= 0 [
+    report "withdrawal"
+  ]
+
+  let elapsed time - baseline-duration
+  let cycle-length reward-duration + withdrawal-duration
+  let position-in-cycle elapsed mod cycle-length
+
+  if position-in-cycle < reward-duration [
+    report "reward"
+  ]
+
+  report "withdrawal"
+end
+
+
+to-report cycle-at [time]
+  if time < baseline-duration or reward-cycles <= 0 [
+    report 0
+  ]
+
+  let elapsed time - baseline-duration
+  let cycle-length reward-duration + withdrawal-duration
+  let cycle-number 1 + floor (elapsed / cycle-length)
+
+  report min list reward-cycles cycle-number
+end
+
+
+to-report reward-active?
+  report current-phase = "reward"
+end
+
+;; true лише для пауз між бонусними кампаніями.
+to-report inter-cycle-withdrawal?
+  report current-phase = "withdrawal"
+    and reward-cycles > 1
+    and current-cycle < reward-cycles
+end
+
+;; true для періоду після останньої бонусної кампанії.
+;; У сценарії без бонусів весь post-baseline період є фінальним контролем.
+to-report final-withdrawal?
+  if current-phase != "withdrawal" [ report false ]
+  if reward-cycles <= 0 [ report true ]
+  report current-cycle = reward-cycles
+end
+
+
+;; =========================================================
+;; SHOPPER PIPELINE
+;; =========================================================
+;; Послідовність одного кроку агента є явним алгоритмом:
+;; 1) прийняти рішення;
+;; 2) записати результат;
+;; 3) оновити поведінковий стан.
+
+to perform-shopper-step
+  choose-behavior
+  record-shopper-result
+  update-behavioral-state
+  update-satisfaction
+  update-opinion-from-experience
+end
+
+
+;; =========================================================
+;; SHOPPER DECISION MODULE
+;; =========================================================
+
+to choose-behavior
+  ;; Utility визначає імовірність, а не жорсткий результат.
+  set chose-target?
+    random-float 1 < target-choice-probability
+end
+
+
+to-report target-choice-probability
+  report logistic target-choice-utility
+end
+
+
+to-report target-choice-utility
+  report intrinsic-contribution
+    + habit-contribution
+    + reward-contribution
+    + opinion-contribution
+    - price-contribution
+end
+
+
+to-report intrinsic-contribution
+  ;; Intrinsic motivation є динамічним станом, а не окремою sensitivity.
+  report intrinsic-motivation
+end
+
+
+to-report habit-contribution
+  report habit-sensitivity * habit
+end
+
+
+to-report reward-contribution
+  report reward-sensitivity * active-reward-salience
+end
+
+
+to-report opinion-contribution
+  ;; Opinion є довгостроковою ставленнєвою оцінкою. WOM впливає на
+  ;; вибір опосередковано: спершу змінює opinion, а вже opinion — utility.
+  report opinion-weight * opinion
+end
+
+
+to-report price-contribution
+  report price-sensitivity * target-choice-cost
+end
+
+;; Єдина точка визначення поточної політики винагороди для агента.
+;; Інші модулі не звертаються до low-reward-salience/high-reward-salience напряму.
+to-report active-reward-salience
+  if not reward-active? [ report 0 ]
+
+  if treatment-group = "low-salience" [
+    report low-reward-salience
+  ]
+
+  if treatment-group = "high-salience" [
+    report high-reward-salience
+  ]
+
+  report 0
+end
+
+
+;; =========================================================
+;; BEHAVIORAL STATE MODULE
+;; =========================================================
+;; Цей модуль реалізує одну конкретну поведінкову модель. У майбутньому
+;; сюди можна додати інші механізми без зміни Simulation Controller.
+
+to update-behavioral-state
+  update-habit-state
+  update-intrinsic-motivation-state
+end
+
+
+to update-habit-state
+  ;; Звичка є ковзною часткою цільових виборів у пам'яті агента.
+  ;; Тому вона формується виключно через повторення і не потребує
+  ;; окремого habit-learning-rate або habit-decay-rate.
+  let current-choice ifelse-value chose-target? [1] [0]
+  set recent-choice-history
+    fput current-choice (but-last recent-choice-history)
+  set habit mean recent-choice-history
+end
+
+
+to update-intrinsic-motivation-state
+  ;; Мотивація змінюється лише після фактичного цільового вибору
+  ;; під час активної бонусної програми для treatment-груп.
+  if not reward-active? [ stop ]
+  if treatment-group = "control" [ stop ]
+  if not chose-target? [ stop ]
+
+  let salience active-reward-salience
+
+  ifelse salience <= salience-threshold [
+    apply-supportive-reward salience
+  ]
+  [
+    apply-crowding-out salience
+  ]
+end
+
+
+to apply-supportive-reward [salience]
+  ;; Підтримувальна винагорода може підтверджувати цінність поведінки.
+  ;; habit-memory-window задає спільний часовий масштаб адаптації.
+  let supportive-signal salience-threshold - salience
+  let reinforcement
+    supportive-signal
+    * (1 - intrinsic-motivation)
+    / habit-memory-window
+
+  set intrinsic-motivation
+    clamp (intrinsic-motivation + reinforcement) 0 1
+end
+
+
+to apply-crowding-out [salience]
+  ;; Надмірно значуща винагорода може сприйматися як зовнішній контроль.
+  ;; Сила реакції відрізняється між агентами через autonomy-sensitivity.
+  let controlling-signal salience - salience-threshold
+  let motivation-loss
+    autonomy-sensitivity
+    * controlling-signal
+    * intrinsic-motivation
+    / habit-memory-window
+
+  set intrinsic-motivation
+    clamp (intrinsic-motivation - motivation-loss) 0 1
+end
+
+;; =========================================================
+;; EXPERIENCE, OPINION AND WORD-OF-MOUTH MODULE
+;; =========================================================
+
+;; Satisfaction — оцінка саме поточної покупки. Випадковий шум
+;; відображає варіативність обслуговування та суб'єктивного сприйняття.
+to update-satisfaction
+  let expected-experience -0.05
+
+  if chose-target? [
+    set expected-experience 0.25
+
+    ;; Бонус підвищує задоволеність лише тоді, коли він реально активний
+    ;; для treatment-групи й агент здійснив цільовий вибір.
+    set expected-experience expected-experience
+      + 0.45 * active-reward-salience
+  ]
+
+  set satisfaction clamp
+    (random-normal expected-experience 0.15)
+    -1 1
+end
+
+
+;; Власний новий досвід поступово притягує накопичений opinion до
+;; поточного satisfaction. Індивідуальний rate задає довжину пам'яті.
+to update-opinion-from-experience
+  set opinion clamp
+    (opinion + opinion-update-rate * (satisfaction - opinion))
+    -1 1
+end
+
+
+;; WOM є подією комунікації, а не постійним станом агента.
+;; 1) скидаємо тимчасові буфери;
+;; 2) визначаємо, хто говорить;
+;; 3) відбираємо повідомлення в межах confidence-bound;
+;; 4) накопичуємо прийняті повідомлення;
+;; 5) один раз оновлюємо opinion кожного слухача.
+to perform-word-of-mouth-step
+  ask shoppers [
+    set received-wom 0
+    set received-wom-count 0
+    set spoke-wom? false
+    set wom-opinion-change 0
+  ]
+
+  if not wom-on? [ stop ]
+
+  if purchase-deliberation-mode = "low-involvement" [
+    perform-low-involvement-wom
+  ]
+
+  if purchase-deliberation-mode = "high-involvement" [
+    perform-high-involvement-wom
+  ]
+
+  apply-received-wom
+end
+
+
+;; LOW-INVOLVEMENT PURCHASE
+;; Спонтанна рекомендація: активний speaker повідомляє свою думку одному
+;; випадковому знайомому. Слухач використовує лише першу прийняту
+;; рекомендацію на цьому tick, що моделює просте рішення з низькою ціною
+;; помилки (наприклад, спробувати нову кав'ярню).
+to perform-low-involvement-wom
+  ask shoppers [
+    let talk-probability clamp (talk-propensity * abs opinion) 0 1
+
+    if random-float 1 < talk-probability and any? link-neighbors [
+      set spoke-wom? true
+
+      let listener one-of link-neighbors
+      let message outgoing-wom-message
+
+      ask listener [
+        if received-wom-count = 0 [
+          let discrepancy abs (message - opinion)
+
+          if discrepancy <= confidence-bound [
+            set received-wom message
+            set received-wom-count 1
+          ]
+        ]
+      ]
+    ]
+  ]
+end
+
+
+;; HIGH-INVOLVEMENT PURCHASE
+;; Цілеспрямований пошук інформації: кожен покупець звертається до всіх
+;; своїх безпосередніх знайомих. Кожен знайомий ділиться думкою з
+;; імовірністю, що залежить від talk-propensity та сили opinion.
+;; Покупець агрегує всі повідомлення, що потрапили в confidence-bound.
+to perform-high-involvement-wom
+  ask shoppers with [any? link-neighbors] [
+    let listener self
+
+    ask link-neighbors [
+      let share-probability clamp (talk-propensity * abs opinion) 0 1
+
+      if random-float 1 < share-probability [
+        set spoke-wom? true
+        let message outgoing-wom-message
+
+        ask listener [
+          let discrepancy abs (message - opinion)
+
+          if discrepancy <= confidence-bound [
+            set received-wom received-wom + message
+            set received-wom-count received-wom-count + 1
+          ]
+        ]
+      ]
+    ]
+  ]
+end
+
+
+;; Оновлення виконується один раз після завершення всіх комунікацій.
+;; social-susceptibility визначає силу зміни після того, як повідомлення
+;; вже пройшли фільтр прийняття.
+to apply-received-wom
+  ask shoppers with [received-wom-count > 0] [
+    let old-opinion opinion
+    let social-signal received-wom / received-wom-count
+
+    set opinion clamp
+      (opinion + social-susceptibility * (social-signal - opinion))
+      -1 1
+
+    set wom-opinion-change opinion - old-opinion
+  ]
+end
+
+
+;; Повідомлення поєднує накопичене ставлення та останній досвід.
+;; Opinion робить сигнал стабільним, satisfaction дозволяє швидко
+;; поширювати реакцію на поточну покупку або активну винагороду.
+to-report outgoing-wom-message
+  report clamp (0.7 * opinion + 0.3 * satisfaction) -1 1
+end
+
+
+;; Частка агентів, які прийняли хоча б одне WOM-повідомлення.
+to-report wom-receiver-share
+  if not any? shoppers [ report 0 ]
+  report count shoppers with [received-wom-count > 0] / count shoppers
+end
+
+
+;; Середній абсолютний зсув opinion, без взаємного погашення позитивних
+;; і негативних змін.
+to-report mean-absolute-wom-opinion-change
+  if not any? shoppers [ report 0 ]
+  report mean [abs wom-opinion-change] of shoppers
+end
+
+
+;; =========================================================
+;; METRICS MODULE: RECORDING
+;; =========================================================
+
+to record-shopper-result
+  if not chose-target? [ stop ]
+
+  if current-phase = "baseline" [
+    set baseline-target-choices baseline-target-choices + 1
+  ]
+
+  if current-phase = "reward" [
+    set reward-target-choices reward-target-choices + 1
+  ]
+
+  ;; Проміжні та фінальний withdrawal зберігаються окремо.
+  ;; Це дозволяє оцінювати реакцію між кампаніями незалежно від
+  ;; довгострокової стійкості після завершення всієї програми.
+  if inter-cycle-withdrawal? [
+    set inter-cycle-withdrawal-target-choices
+      inter-cycle-withdrawal-target-choices + 1
+  ]
+
+  if final-withdrawal? [
+    set final-withdrawal-target-choices
+      final-withdrawal-target-choices + 1
+  ]
+end
+
+
+to record-system-state
+  if current-phase = "baseline" [
+    set baseline-ticks-completed baseline-ticks-completed + 1
+  ]
+
+  if current-phase = "reward" [
+    set reward-ticks-completed reward-ticks-completed + 1
+  ]
+
+  if inter-cycle-withdrawal? [
+    set inter-cycle-withdrawal-ticks-completed
+      inter-cycle-withdrawal-ticks-completed + 1
+  ]
+    
+  if final-withdrawal? [
+    set final-withdrawal-ticks-completed
+      final-withdrawal-ticks-completed + 1
+  ]
+end
+
+
+;; =========================================================
+;; METRICS MODULE: BASIC METRICS
+;; =========================================================
+
+;; Поточна частка агентів групи, які здійснили цільовий вибір
+;; на поточному tick. Reporter призначений для побудови часових
+;; рядів у BehaviorSpace і не використовує накопичені фазові метрики.
+to-report current-choice-rate [group-name]
+  let selected-shoppers shoppers with [
+    treatment-group = group-name
+  ]
+
+  if not any? selected-shoppers [ report 0 ]
+
+  report mean [
+    ifelse-value chose-target? [1] [0]
+  ] of selected-shoppers
+end
+
+
+to-report choice-rate [group-name phase-name]
+  let selected-shoppers shoppers with [
+    treatment-group = group-name
+  ]
+
+  let group-size count selected-shoppers
+  if group-size = 0 [ report 0 ]
+
+  if phase-name = "baseline" [
+    report safe-rate
+      (sum [baseline-target-choices] of selected-shoppers)
+      (group-size * baseline-ticks-completed)
+  ]
+
+  if phase-name = "reward" [
+    report safe-rate
+      (sum [reward-target-choices] of selected-shoppers)
+      (group-size * reward-ticks-completed)
+  ]
+
+  if phase-name = "inter-cycle-withdrawal" [
+    report safe-rate
+      (sum [inter-cycle-withdrawal-target-choices] of selected-shoppers)
+      (group-size * inter-cycle-withdrawal-ticks-completed)
+  ]
+
+  if phase-name = "final-withdrawal" [
+    report safe-rate
+      (sum [final-withdrawal-target-choices] of selected-shoppers)
+      (group-size * final-withdrawal-ticks-completed)
+  ]
+
+  ;; Backward-compatible aggregate across every withdrawal period.
+  if phase-name = "withdrawal" [
+    let target-choices
+      sum [inter-cycle-withdrawal-target-choices] of selected-shoppers
+      + sum [final-withdrawal-target-choices] of selected-shoppers
+
+    let withdrawal-ticks
+      inter-cycle-withdrawal-ticks-completed
+      + final-withdrawal-ticks-completed
+
+    report safe-rate target-choices (group-size * withdrawal-ticks)
+  ]
+
+  report 0
+end
+
+
+;; Зручні wrappers, що роблять призначення метрик явним.
+to-report inter-cycle-choice-rate [group-name]
+  report choice-rate group-name "inter-cycle-withdrawal"
+end
+
+
+to-report final-withdrawal-choice-rate [group-name]
+  report choice-rate group-name "final-withdrawal"
+end
+
+
+;; Persistence is the observed target-choice rate during the final
+;; post-reward withdrawal period. It answers whether the target behavior
+;; continues after all points have stopped.
+to-report persistence [group-name]
+  report final-withdrawal-choice-rate group-name
+end
+
+
+;; Persistence Index compares post-reward persistence with the same
+;; group's pre-reward baseline choice rate.
+;; > 0: behavior remains above baseline;
+;; = 0: behavior returns to baseline;
+;; < 0: behavior falls below baseline.
+to-report persistence-index [group-name]
+  report persistence group-name - choice-rate group-name "baseline"
+end
+
+to-report mean-intrinsic-motivation [group-name]
+  let selected-shoppers shoppers with [
+    treatment-group = group-name
+  ]
+
+  if not any? selected-shoppers [ report 0 ]
+  report mean [intrinsic-motivation] of selected-shoppers
+end
+
+
+to-report mean-habit [group-name]
+  let selected-shoppers shoppers with [
+    treatment-group = group-name
+  ]
+
+  if not any? selected-shoppers [ report 0 ]
+  report mean [habit] of selected-shoppers
+end
+
+
+;; =========================================================
+;; METRICS MODULE: DERIVED BUSINESS METRICS
+;; =========================================================
+
+;; Універсальна різниця між treatment-групою та control після бонусів.
+to-report post-reward-effect [group-name]
+  ;; Порівняння виконується лише у фінальному withdrawal, тобто після
+  ;; завершення всієї послідовності бонусних кампаній.
+  report final-withdrawal-choice-rate group-name
+    - final-withdrawal-choice-rate "control"
+end
+
+;; Від'ємне значення означає crowding-out high-salience групи.
+to-report high-reward-crowding-out-effect
+  report post-reward-effect "high-salience"
+end
+
+;; Додатне значення означає довготривалий позитивний ефект low-salience.
+to-report low-reward-persistence-effect
+  report post-reward-effect "low-salience"
+end
+
+
+to-report withdrawal-drop [group-name]
+  report choice-rate group-name "reward"
+    - final-withdrawal-choice-rate group-name
+end
+
+
+to-report high-reward-withdrawal-drop
+  report withdrawal-drop "high-salience"
+end
+
+
+to-report low-reward-withdrawal-drop
+  report withdrawal-drop "low-salience"
+end
+
+;; Конкретні reporters залишені як стабільний зовнішній контракт моделі.
+;; Загальний persistence-ratio навмисно не використовується.
+to-report high-reward-retention-ratio
+  report safe-rate
+    (final-withdrawal-choice-rate "high-salience")
+    (choice-rate "high-salience" "reward")
+end
+
+
+to-report low-reward-retention-ratio
+  report safe-rate
+    (final-withdrawal-choice-rate "low-salience")
+    (choice-rate "low-salience" "reward")
+end
+
+
+;; Середні показники нових механізмів для UI та BehaviorSpace.
+to-report mean-satisfaction [group-name]
+  let group-agents shoppers with [treatment-group = group-name]
+  if not any? group-agents [ report 0 ]
+  report mean [satisfaction] of group-agents
+end
+
+
+to-report mean-opinion [group-name]
+  let group-agents shoppers with [treatment-group = group-name]
+  if not any? group-agents [ report 0 ]
+  report mean [opinion] of group-agents
+end
+
+
+to-report wom-speaker-share
+  if not any? shoppers [ report 0 ]
+  report count shoppers with [spoke-wom?] / count shoppers
+end
+
+
+to-report mean-network-degree
+  if not any? shoppers [ report 0 ]
+  report mean [count link-neighbors] of shoppers
+end
+
+
+;; =========================================================
+;; VISUALIZATION MODULE
+;; =========================================================
+
+to update-visualization
+  ask links [ set hidden? not show-network? ]
+
+  ask shoppers [
+    ;; X = intrinsic motivation; Y = habit strength.
+    let x-position scale-value intrinsic-motivation min-pxcor max-pxcor
+    let y-position scale-value habit min-pycor max-pycor
+
+    ;; Невеликий jitter зменшує повне накладання агентів.
+    set x-position x-position + random-float 0.3 - 0.15
+    set y-position y-position + random-float 0.3 - 0.15
+
+    setxy
+      clamp x-position min-pxcor max-pxcor
+      clamp y-position min-pycor max-pycor
+
+    ifelse chose-target? [
+      set size 1
+    ]
+    [
+      set size 0.55
+    ]
+  ]
+end
+
+
+to-report scale-value [value minimum maximum]
+  report minimum + value * (maximum - minimum)
+end
+
+
+;; =========================================================
+;; UTILITY FUNCTIONS
+;; =========================================================
+
+to-report safe-rate [numerator denominator]
+  if denominator = 0 [ report 0 ]
+  report numerator / denominator
+end
+
+
+to-report logistic [value]
+  ;; Обмеження аргументу запобігає переповненню exp().
+  let bounded-value clamp value -20 20
+  report 1 / (1 + exp (- bounded-value))
+end
+
+
+to-report clamp [value minimum maximum]
+  report max list minimum (min list maximum value)
+end
+
+
+to-report bounded-random-normal
+  [mean-value deviation minimum maximum]
+
+  report clamp
+    (random-normal mean-value deviation)
+    minimum
+    maximum
+end
+
+
+;; =========================================================
+;; BEHAVIORSEARCH FITNESS REPORTERS
+;; =========================================================
+;; These reporters convert the multi-criteria policy objective into
+;; one scalar fitness value that BehaviorSearch can maximize.
+;; The final withdrawal horizon should be held fixed during search.
+
+;; Normalized reward exposure/cost over the proposed search space.
+;; Maximum reference exposure = 0.95 salience * 80 ticks * 4 cycles.
+to-report behaviorsearch-normalized-cost
+  report (high-reward-salience * reward-duration * reward-cycles)
+         / (0.95 * 80 * 4)
+end
+
+;; Balanced policy objective:
+;; 1) prioritize durable behavior after withdrawal;
+;; 2) retain some value for uptake while rewards are active;
+;; 3) reward preservation of intrinsic motivation relative to control;
+;; 4) penalize more intensive/costly campaign configurations.
+;; Expected approximate scale is around 0 to 0.35 for the current model.
+to-report behaviorsearch-fitness
+  let durability persistence-index "high-salience"
+  let uptake choice-rate "high-salience" "reward"
+  let motivation-gap high-reward-crowding-out-effect
+  let policy-cost behaviorsearch-normalized-cost
+
+  report durability
+       + 0.20 * uptake
+       + 0.50 * motivation-gap
+       - 0.10 * policy-cost
+end
+
+;; Alternative constrained-style objective. A negative motivation gap
+;; is penalized more strongly, while a positive gap receives no bonus.
+to-report behaviorsearch-fitness-no-crowding
+  let durability persistence-index "high-salience"
+  let uptake choice-rate "high-salience" "reward"
+  let motivation-penalty min list 0 high-reward-crowding-out-effect
+  let policy-cost behaviorsearch-normalized-cost
+
+  report durability
+       + 0.20 * uptake
+       + 1.00 * motivation-penalty
+       - 0.10 * policy-cost
+end
+]]></code>
+  <widgets>
+    <view x="455" wrappingAllowedX="false" y="15" frameRate="30.0" minPycor="-16" height="515" showTickCounter="true" patchSize="15.5" fontSize="10" wrappingAllowedY="false" width="515" tickCounterLabel="ticks" maxPycor="16" updateMode="0" maxPxcor="16" minPxcor="-16"></view>
+    <slider x="30" step="1" y="115" max="6" display="reward-cycles" height="33" min="0" direction="Horizontal" default="1.0" variable="reward-cycles" width="125" sizeVersion="0"></slider>
+    <slider x="30" step="5" y="158" max="200" display="reward-duration" height="33" min="10" direction="Horizontal" default="60.0" variable="reward-duration" width="140" sizeVersion="0"></slider>
+    <slider x="30" step="0.05" y="200" max="1" display="low-reward-salience" height="33" min="0" direction="Horizontal" default="0.15" variable="low-reward-salience" width="175" sizeVersion="0"></slider>
+    <slider x="215" step="0.05" y="200" max="1" display="high-reward-salience" height="33" min="0" direction="Horizontal" default="0.9" variable="high-reward-salience" width="175" sizeVersion="0"></slider>
+    <plot x="985" autoPlotX="true" yMax="0.5" autoPlotY="false" y="630" xMin="0.0" height="195" legend="true" xMax="160.0" yMin="-0.5" width="390" display="Intrinsic Motivation Gap vs Control">
+      <setup></setup>
+      <update></update>
+      <pen interval="1.0" mode="0" display="Low salience - control" color="-11221820" legend="true">
+        <setup></setup>
+        <update>plotxy ticks (
+  mean [intrinsic-motivation] of shoppers with [treatment-group = "low-salience"]
+  - mean [intrinsic-motivation] of shoppers with [treatment-group = "control"]
+)</update>
+      </pen>
+      <pen interval="1.0" mode="0" display="High salience - control" color="-2674135" legend="true">
+        <setup></setup>
+        <update>plotxy ticks (
+  mean [intrinsic-motivation] of shoppers with [treatment-group = "high-salience"]
+  - mean [intrinsic-motivation] of shoppers with [treatment-group = "control"]
+)</update>
+      </pen>
+      <pen interval="1.0" mode="0" display="Zero reference" color="-7500403" legend="false">
+        <setup></setup>
+        <update>plotxy ticks 0</update>
+      </pen>
+    </plot>
+    <plot x="985" autoPlotX="true" yMax="1.0" autoPlotY="false" y="430" xMin="0.0" height="195" legend="true" xMax="160.0" yMin="0.0" width="390" display="Mean Habit Strength">
+      <setup></setup>
+      <update></update>
+      <pen interval="1.0" mode="0" display="Control" color="-15575016" legend="true">
+        <setup></setup>
+        <update>plotxy ticks mean [habit] of shoppers with [
+    treatment-group = "control"
+]</update>
+      </pen>
+      <pen interval="1.0" mode="0" display="Low salience" color="-11221820" legend="true">
+        <setup></setup>
+        <update>plotxy ticks mean [habit] of shoppers with [
+    treatment-group = "low-salience"
+]</update>
+      </pen>
+      <pen interval="1.0" mode="0" display="High salience" color="-2674135" legend="true">
+        <setup></setup>
+        <update>plotxy ticks mean [habit] of shoppers with [
+    treatment-group = "high-salience"
+]</update>
+      </pen>
+    </plot>
+    <plot x="985" autoPlotX="true" yMax="1.0" autoPlotY="false" y="240" xMin="0.0" height="185" legend="true" xMax="160.0" yMin="0.0" width="390" display="Mean Intrinsic Motivation">
+      <setup></setup>
+      <update></update>
+      <pen interval="1.0" mode="0" display="Control" color="-15575016" legend="true">
+        <setup></setup>
+        <update>plotxy ticks mean [intrinsic-motivation] of shoppers with [
+    treatment-group = "control"
+]</update>
+      </pen>
+      <pen interval="1.0" mode="0" display="Low salience" color="-11221820" legend="true">
+        <setup></setup>
+        <update>plotxy ticks mean [intrinsic-motivation] of shoppers with [
+    treatment-group = "low-salience"
+]</update>
+      </pen>
+      <pen interval="1.0" mode="0" display="High salience" color="-2674135" legend="true">
+        <setup></setup>
+        <update>plotxy ticks mean [intrinsic-motivation] of shoppers with [
+    treatment-group = "high-salience"
+]</update>
+      </pen>
+    </plot>
+    <plot x="985" autoPlotX="true" yMax="1.0" autoPlotY="true" y="10" xMin="0.0" height="220" legend="true" xMax="0.0" yMin="0.0" width="390" display="Target choice rate">
+      <setup></setup>
+      <update></update>
+      <pen interval="1.0" mode="0" display="Control" color="-15575016" legend="true">
+        <setup></setup>
+        <update>plot count shoppers with [
+  treatment-group = "control" and chose-target?
+] / count shoppers with [
+  treatment-group = "control"
+]</update>
+      </pen>
+      <pen interval="1.0" mode="0" display="Low salience" color="-11221820" legend="true">
+        <setup></setup>
+        <update>plot count shoppers with [
+  treatment-group = "low-salience" and chose-target?
+] / count shoppers with [
+  treatment-group = "low-salience"
+]</update>
+      </pen>
+      <pen interval="1.0" mode="0" display="High salience" color="-2674135" legend="true">
+        <setup></setup>
+        <update>plot count shoppers with [
+  treatment-group = "high-salience" and chose-target?
+] / count shoppers with [
+  treatment-group = "high-salience"
+]</update>
+      </pen>
+    </plot>
+    <plot x="1385" autoPlotX="true" yMax="1.0" autoPlotY="false" y="10" xMin="0.0" height="270" legend="true" xMax="160.0" yMin="0.0" width="390" display="Persistence after reward withdrawal">
+      <setup></setup>
+      <update></update>
+      <pen interval="1.0" mode="0" display="Control" color="-15575016" legend="true">
+        <setup></setup>
+        <update><![CDATA[if final-withdrawal-ticks-completed > 0 [ plotxy ticks persistence "control" ]]]></update>
+      </pen>
+      <pen interval="1.0" mode="0" display="Low salience" color="-11221820" legend="true">
+        <setup></setup>
+        <update><![CDATA[if final-withdrawal-ticks-completed > 0 [ plotxy ticks persistence "low-salience" ]]]></update>
+      </pen>
+      <pen interval="1.0" mode="0" display="High salience" color="-2674135" legend="true">
+        <setup></setup>
+        <update><![CDATA[if final-withdrawal-ticks-completed > 0 [ plotxy ticks persistence "high-salience" ]]]></update>
+      </pen>
+    </plot>
+    <plot x="1385" autoPlotX="true" yMax="0.5" autoPlotY="false" y="290" xMin="0.0" height="395" legend="true" xMax="160.0" yMin="-0.5" width="390" display="Persistence Index">
+      <setup></setup>
+      <update></update>
+      <pen interval="1.0" mode="0" display="Control" color="-15575016" legend="true">
+        <setup></setup>
+        <update><![CDATA[if final-withdrawal-ticks-completed > 0 [ plotxy ticks persistence-index "control" ]]]></update>
+      </pen>
+      <pen interval="1.0" mode="0" display="Low salience" color="-11221820" legend="true">
+        <setup></setup>
+        <update><![CDATA[if final-withdrawal-ticks-completed > 0 [ plotxy ticks persistence-index "low-salience" ]]]></update>
+      </pen>
+      <pen interval="1.0" mode="0" display="High salience" color="-2674135" legend="true">
+        <setup></setup>
+        <update><![CDATA[if final-withdrawal-ticks-completed > 0 [ plotxy ticks persistence-index "high-salience" ]]]></update>
+      </pen>
+      <pen interval="1.0" mode="0" display="Zero reference" color="-7500403" legend="false">
+        <setup></setup>
+        <update><![CDATA[if final-withdrawal-ticks-completed > 0 [ plotxy ticks 0 ]]]></update>
+      </pen>
+    </plot>
+    <plot x="1385" autoPlotX="true" yMax="1.0" autoPlotY="false" y="700" xMin="0.0" height="220" legend="true" xMax="160.0" yMin="-1.0" width="390" display="Mean Satisfaction">
+      <setup></setup>
+      <update></update>
+      <pen interval="1.0" mode="0" display="Control" color="-10899396" legend="true">
+        <setup></setup>
+        <update>plot mean-satisfaction "control"</update>
+      </pen>
+      <pen interval="1.0" mode="0" display="Low salience" color="-11221820" legend="true">
+        <setup></setup>
+        <update>plot mean-satisfaction "low-salience"</update>
+      </pen>
+      <pen interval="1.0" mode="0" display="High salience" color="-2674135" legend="true">
+        <setup></setup>
+        <update>plot mean-satisfaction "high-salience"</update>
+      </pen>
+    </plot>
+    <plot x="1385" autoPlotX="true" yMax="1.0" autoPlotY="false" y="930" xMin="0.0" height="220" legend="true" xMax="160.0" yMin="-1.0" width="390" display="Mean Opinion">
+      <setup></setup>
+      <update></update>
+      <pen interval="1.0" mode="0" display="Control" color="-10899396" legend="true">
+        <setup></setup>
+        <update>plot mean-opinion "control"</update>
+      </pen>
+      <pen interval="1.0" mode="0" display="Low salience" color="-11221820" legend="true">
+        <setup></setup>
+        <update>plot mean-opinion "low-salience"</update>
+      </pen>
+      <pen interval="1.0" mode="0" display="High salience" color="-2674135" legend="true">
+        <setup></setup>
+        <update>plot mean-opinion "high-salience"</update>
+      </pen>
+    </plot>
+    <note x="35" y="265" backgroundDark="0" fontSize="12" width="240" markdown="false" height="25" textColorDark="-1" textColorLight="-16777216" backgroundLight="0">Social network and WOM</note>
+    <switch x="180" y="300" height="35" on="false" variable="show-network?" display="show-network?" width="150" sizeVersion="0"></switch>
+    <note x="30" y="80" backgroundDark="0" fontSize="12" width="150" markdown="false" height="25" textColorDark="-1" textColorLight="-16777216" backgroundLight="0">Loyalty program</note>
+    <note x="600" y="655" backgroundDark="0" fontSize="12" width="230" markdown="false" height="30" textColorDark="-1" textColorLight="-16777216" backgroundLight="0">Persistence Index (post − baseline)</note>
+    <monitor x="510" precision="3" y="690" height="60" fontSize="11" display="Control" width="105" sizeVersion="0">persistence-index "control"</monitor>
+    <monitor x="642" precision="3" y="690" height="60" fontSize="11" display="Low Salience" width="100" sizeVersion="0">persistence-index "low-salience"</monitor>
+    <monitor x="770" precision="3" y="690" height="60" fontSize="11" display="High Salience" width="100" sizeVersion="0">persistence-index "high-salience"</monitor>
+    <chooser x="35" y="345" height="55" variable="network-topology" current="0" display="network-topology" width="190" sizeVersion="0">
+      <choice type="string" value="small-world"></choice>
+      <choice type="string" value="preferential-attachment"></choice>
+      <choice type="string" value="ring-lattice"></choice>
+      <choice type="string" value="random"></choice>
+    </chooser>
+    <slider x="215" step="5" y="158" max="200" display="withdrawal-duration" height="33" min="10" direction="Horizontal" default="60.0" variable="withdrawal-duration" width="175" sizeVersion="0"></slider>
+    <monitor x="770" precision="3" y="575" height="60" fontSize="11" display="High Salience" width="100" sizeVersion="0">persistence "high-salience"</monitor>
+    <monitor x="642" precision="3" y="575" height="60" fontSize="11" display="Low Salience" width="100" sizeVersion="0">persistence "low-salience"</monitor>
+    <monitor x="510" precision="3" y="575" height="60" fontSize="11" display="Control" width="105" sizeVersion="0">persistence "control"</monitor>
+    <button x="30" y="15" height="40" disableUntilTicks="false" forever="false" kind="Observer" width="55">setup</button>
+    <slider x="240" step="2" y="345" max="20" display="network-degree" height="33" min="2" direction="Horizontal" default="6.0" variable="network-degree" width="180" sizeVersion="0"></slider>
+    <note x="605" y="550" backgroundDark="0" fontSize="12" width="220" markdown="false" height="30" textColorDark="-1" textColorLight="-16777216" backgroundLight="0">Persistence (final withdrawal)</note>
+    <button x="90" y="15" height="40" disableUntilTicks="false" forever="true" kind="Observer" width="55">go</button>
+    <slider x="170" step="20" y="20" max="3000" display="number-of-shoppers" height="33" min="20" direction="Horizontal" default="1000.0" variable="number-of-shoppers" width="170" sizeVersion="0"></slider>
+    <switch x="35" y="300" height="35" on="true" variable="wom-on?" display="wom-on?" width="130" sizeVersion="0"></switch>
+    <monitor x="25" precision="4" y="890" height="60" fontSize="11" width="195" display="WOM receiver share">wom-receiver-share</monitor>
+    <monitor x="25" precision="17" y="520" height="60" fontSize="11" width="205">current-phase</monitor>
+    <monitor x="240" precision="2" y="655" height="60" fontSize="11" width="195" display="Mean network degree">mean-network-degree</monitor>
+    <monitor x="25" precision="3" y="655" height="60" fontSize="11" width="205" display="WOM speaker share">wom-speaker-share</monitor>
+    <monitor x="240" precision="3" y="585" height="60" fontSize="11" width="200">low-reward-persistence-effect</monitor>
+    <monitor x="25" precision="3" y="585" height="60" fontSize="11" width="205">high-reward-crowding-out-effect</monitor>
+    <monitor x="240" precision="0" y="520" height="60" fontSize="11" width="200" display="current-cycle">current-cycle</monitor>
+    <monitor x="25" precision="4" y="830" height="60" fontSize="11" width="170" display="Mean received-wom-count">mean [received-wom-count] of shoppers</monitor>
+    <monitor x="230" precision="4" y="830" height="60" fontSize="11" width="205" display="Mean average received WOM"><![CDATA[mean [received-wom / received-wom-count] of shoppers with [received-wom-count > 0]]]></monitor>
+    <monitor x="230" precision="4" y="890" height="60" fontSize="11" width="195" display="Mean |WOM opinion change|">mean-absolute-wom-opinion-change</monitor>
+    <monitor x="305" precision="4" y="745" height="60" fontSize="11" width="135">wom-speaker-share</monitor>
+    <monitor x="165" precision="4" y="745" height="60" fontSize="11" width="130" display="StdDev Opinion">standard-deviation [opinion] of shoppers</monitor>
+    <monitor x="25" precision="4" y="745" height="60" fontSize="11" width="130" display="Mean opinion">mean [opinion] of shoppers</monitor>
+    <slider x="240" step="0.05" y="475" max="2" display="confidence-bound" height="33" min="0.05" direction="Horizontal" default="0.75" variable="confidence-bound" width="175" sizeVersion="0"></slider>
+    <chooser x="30" y="455" height="55" variable="purchase-deliberation-mode" current="1" display="purchase-deliberation-mode" width="200" sizeVersion="0">
+      <choice type="string" value="low-involvement"></choice>
+      <choice type="string" value="high-involvement"></choice>
+    </chooser>
+    <slider x="240" step="0.25" y="440" max="3" display="opinion-weight" height="33" min="0" direction="Horizontal" default="0.5" variable="opinion-weight" width="175" sizeVersion="0"></slider>
+    <slider x="240" step="0.05" y="380" max="1" display="rewiring-probability" height="33" min="0" direction="Horizontal" default="0.15" variable="rewiring-probability" width="180" sizeVersion="0"></slider>
+  </widgets>
+  <info># Агентна модель програм лояльності, satisfaction, opinion і WOM
+
+## Призначення
+
+Модель досліджує, як бонусна програма впливає на цільовий вибір покупців через зовнішню винагороду, формування звички, зміну внутрішньої мотивації, накопичене ставлення та word of mouth (WOM). Особлива увага приділяється поведінці після завершення програми: чи зберігається ефект завдяки звичці та позитивному соціальному підкріпленню, чи негативний досвід прискорює згасання.
+
+## Основний причинний ланцюг
+
+`покупка → satisfaction → opinion → WOM → opinion сусідів → майбутній вибір`
+
+- **satisfaction** — випадкова оцінка окремої поточної покупки в діапазоні `[-1; 1]`;
+- **opinion** — накопичене ставлення, яке враховує попередній досвід;
+- **opinion-weight** — вага opinion у функції корисності вибору;
+- **opinion-update-rate** — індивідуальна чутливість до останнього власного досвіду;
+- **talk-propensity** — стала схильність агента ділитися думкою;
+- **social-susceptibility** — стала схильність довіряти рекомендаціям інших;
+- **WOM** — не окремий стан, а подія передачі поточного opinion сусідам.
+
+Ймовірність висловитися дорівнює `talk-propensity * abs opinion`. Тому агенти з нейтральним ставленням говорять рідше, а агенти із сильним позитивним або негативним opinion — частіше. Якщо агент отримав кілька повідомлень за один tick, вони спочатку усереднюються, після чого opinion оновлюється один раз. Це усуває залежність від випадкового порядку виконання агентів.
+
+## Соціальна мережа
+
+Випадаючий список `network-topology` задає тип соціальної мережі:
+
+- `small-world` — регулярне кільце з випадковим перепідключенням;
+- `ring-lattice` — регулярна кільцева ґратка, створена `nw:generate-watts-strogatz` з нульовою ймовірністю перепідключення;
+- `random` — випадкова мережа Erdős–Rényi `G(n,p)`, створена `nw:generate-random`;
+- `preferential-attachment` — мережа Barabási–Albert з хабами, створена `nw:generate-preferential-attachment`.
+
+Усі топології генерує стандартне розширення NetLogo `nw`. Для `small-world` і `ring-lattice` фактичний середній degree приблизно дорівнює `2 × floor(network-degree / 2)`. Для `random` імовірність ребра обчислюється як `network-degree / (number-of-shoppers - 1)`, а для `preferential-attachment` мінімальна кількість нових зв’язків дорівнює `floor(network-degree / 2)`.
+
+`rewiring-probability` використовується лише для `small-world`, `wom-on?` вмикає або вимикає соціальний канал, а `show-network?` керує лише візуалізацією links.
+
+## Послідовність одного tick
+
+1. Визначення поточної фази програми.
+2. Прийняття рішення всіма агентами.
+3. Запис виборів і оновлення звички та внутрішньої мотивації.
+4. Генерування satisfaction від поточної покупки.
+5. Оновлення opinion на основі власного досвіду.
+6. Визначення агентів, які передають WOM.
+7. Агрегування повідомлень сусідів.
+8. Оновлення opinion під впливом WOM.
+9. Запис метрик і оновлення візуалізації.
+
+## Важливі припущення
+
+- Соціальна мережа залишається статичною протягом одного запуску.
+- Satisfaction не має власної довготривалої пам'яті.
+- Opinion є спільним накопичувачем власного й соціального досвіду.
+- WOM впливає на вибір опосередковано через opinion; силу цього впливу на рішення задає `opinion-weight`.
+- Власний досвід і WOM мають різні коефіцієнти оновлення.
+- Повна історія satisfaction не зберігається, щоб не збільшувати пам'ять у BehaviorSpace; для аналізу використовуються агреговані показники.
+
+---
+
+## Архітектура моделі
+
+Модель організована як конфігуроване симуляційне ядро з окремими модулями: Simulation Controller, Reward Schedule, Shopper Decision, Behavioral State, Metrics і Visualization. Верхньорівневий цикл не містить поведінкових формул; конкретні механізми прийняття рішення та навчання реалізовані в окремих процедурах і можуть бути замінені або розширені.
+
+Reward Schedule підтримує відсутність бонусної програми, одну кампанію та повторні кампанії з паузами. Reporters `inter-cycle-withdrawal?` і `final-withdrawal?` розрізняють проміжні паузи та фінальний період спостереження.
+
+## ЩО МОДЕЛЮЄ ЦЯ МОДЕЛЬ?
+
+Модель досліджує, як бонусні винагороди впливають на сталий або здоровий вибір покупців під час дії програми та після її призупинення. Центральний механізм — баланс між формуванням звички та можливим витісненням внутрішньої мотивації зовнішньою винагородою.
+
+## СТРУКТУРА ЧАСУ
+
+Після baseline модель виконує `reward-cycles` циклів. Кожен цикл має дві фази:
+
+1. `reward-duration` ticks із активними бонусами;
+2. `withdrawal-duration` ticks без бонусів.
+
+Значення `reward-cycles = 0` означає сценарій без бонусної програми. Значення `1` відтворює класичний експеримент baseline → reward → withdrawal. Значення більше 1 створює повторні кампанії з паузами між ними.
+
+## UI-ПАРАМЕТРИ ТА ЇХНІЙ ПОВЕДІНКОВИЙ ЗМІСТ
+
+- `number-of-shoppers` — кількість агентів-покупців.
+- `reward-duration` — тривалість кожного активного бонусного періоду.
+- `withdrawal-duration` — тривалість паузи без бонусів після кожного активного періоду; після останнього циклу це фінальне вікно спостереження.
+- `reward-cycles` — кількість повторень reward → withdrawal.
+- `low-reward` — salience підтримувальної винагороди для low-salience групи.
+- `high-reward` — salience сильної, потенційно контролюючої винагороди.
+- `price-sensitivity`, `habit-sensitivity`, `reward-sensitivity` — сталі індивідуальні реакції агента на ціну, сформовану звичку та винагороду.
+- `autonomy-sensitivity` — індивідуальна чутливість до сприйняття надмірно значущої винагороди як зовнішнього контролю.
+- `habit` обчислюється як частка цільових виборів у вікні останніх 20 можливостей вибору; окремий `habit-memory-window` не використовується.
+
+## ПОВЕДІНКА АГЕНТА
+
+Ймовірність цільового вибору визначається внутрішньою мотивацією, силою звички, поточним бонусом і бар'єром цільового вибору. Після вибору модель оновлює звичку. Під час reward-фази low-salience винагорода може підсилювати intrinsic motivation, а high-salience винагорода — знижувати її.
+
+## ВІЗУАЛІЗАЦІЯ
+
+На основному полі X відповідає intrinsic motivation, а Y — habit strength. Колір позначає групу, а збільшений розмір агента означає цільовий вибір у поточному tick.
+
+## ВАЖЛИВА ПРИМІТКА ЩОДО МЕТРИК
+
+`choice-rate ... "reward"` і `choice-rate ... "withdrawal"` агрегують усі reward- та withdrawal-фази відповідно. Це зберігає сумісність зі старими експериментами. Для окремого аналізу кожного циклу в майбутньому слід додати cycle-specific reporters або експортувати метрики на кожному кроці.
+
+## ОСНОВНІ МЕТРИКИ
+
+- `high-reward-crowding-out-effect` — різниця між high-salience та control у withdrawal-фазах.
+- `low-reward-persistence-effect` — різниця між low-salience та control у withdrawal-фазах.
+- `high-reward-withdrawal-drop` — падіння high-salience choice rate після вимкнення бонусів.
+- `high-reward-retention-ratio` — частка поведінки reward-фази, збережена у withdrawal-фазах.
+
+## ЕКСПЕРИМЕНТИ
+
+Існуючі BehaviourSpace-експерименти у файлі не змінювалися. За замовчуванням `reward-cycles = 1`, тому стара одноразова схема залишається відтворюваною.
+
+## Структурний рефакторинг
+
+У цій версії opportunity-лічильники прибрано зі стану кожного покупця. Оскільки кожен агент робить рівно один вибір за tick, кількість можливостей обчислюється як добуток кількості агентів у групі на кількість виконаних ticks відповідної фази. Це не змінює математичний зміст метрик, але робить стан агента та процедуру збору статистики простішими. Невикористовуваний reporter `persistence-ratio` видалено; для аналізу збережено конкретні reporters `high-reward-retention-ratio` і `low-reward-retention-ratio`.
+
+
+## Architecture update: salience parameters and withdrawal semantics
+
+The reward configuration parameters were renamed to `low-reward-salience` and
+`high-reward-salience`. They represent the psychological prominence of the
+reward in the shopper's decision, not its nominal monetary amount.
+
+Withdrawal periods are now represented by two separate metric channels:
+
+- **inter-cycle withdrawal** — a pause between repeated reward campaigns;
+- **final withdrawal** — the observation period after the entire reward
+  schedule has ended.
+
+The generic reporter `choice-rate group "withdrawal"` remains available as a
+backward-compatible aggregate. Business outcome reporters such as
+`high-reward-crowding-out-effect`, withdrawal drop, and retention ratio now use
+only the final withdrawal period. This prevents intermediate campaign pauses
+from being confused with long-term post-program persistence.
+
+The BehaviourSpace experiment designs were not changed. Their parameter names
+were migrated only to keep them compatible with the renamed UI controls.
+
+## Configuration contract
+
+Вхідні параметри поділено на чотири групи:
+
+- **Simulation configuration:** `number-of-shoppers`;
+- **Reward schedule configuration:** `reward-cycles`, `reward-duration`, `withdrawal-duration`;
+- **Reward policy configuration:** `low-reward-salience`, `high-reward-salience`;
+- **Behavioral model configuration:** індивідуальні sensitivity генеруються під час `setup`, а не задаються через UI.
+
+Процедура `validate-configuration` перевіряє типи, діапазони та взаємні обмеження параметрів перед створенням агентів. Некоректна конфігурація завершується пояснювальною помилкою.
+
+## Regression test
+
+BehaviourSpace-експеримент `regression-test` використовує фіксовану конфігурацію і `random-seed 12345`. Він призначений для поведінкової регресійної перевірки після рефакторингу: за незмінних формул і версії NetLogo вихідні метрики мають відтворюватися точно.
+
+
+## Persistence metrics
+
+- **Persistence(group)** is the cumulative target-choice rate during the final withdrawal period after the last reward cycle.
+- **Persistence Index(group)** = Persistence(group) − BaselineChoiceRate(group). Positive values mean the behavior remains above its pre-reward baseline; zero means return to baseline; negative values mean post-reward behavior falls below baseline.
+
+
+## Recommended BehaviorSpace experiments
+
+### E1 reward magnitude and crowding-out
+Varies high reward salience around the model threshold (0.60) while holding schedule constant. It identifies the point at which higher short-term uptake is accompanied by lower intrinsic motivation and weaker post-reward persistence.
+
+### E2 reward magnitude x duration
+Crosses reward magnitude with campaign duration. It tests whether longer exposure creates enough habit to offset motivational crowding-out, using Persistence Index as the main outcome.
+
+### E3 repeated campaign structure
+Varies the number, duration, and withdrawal spacing of campaigns. It tests whether repeated shorter campaigns produce better persistence than a single or prolonged intervention.
+
+All experiments use 30 repetitions per configuration and record behavior, motivation, habit, persistence, withdrawal drop, and retention metrics.
+
+
+## Режими слухання WOM
+
+`purchase-deliberation-mode` задає механізм прийняття рекомендацій:
+
+- `low-involvement`: спонтанний speaker передає рекомендацію одному знайомому; слухач використовує перше прийняте повідомлення на tick. Режим відповідає недорогим і швидким рішенням.
+- `high-involvement`: покупець сам звертається до всіх безпосередніх знайомих у своїй мережі, збирає доступні рекомендації та агрегує прийняті думки. Режим відповідає дорогим покупкам із цілеспрямованим пошуком інформації.
+
+`confidence-bound` задає максимальну допустиму різницю між поточним opinion покупця та отриманою рекомендацією. Повідомлення поза цією межею ігноруються. `social-susceptibility` визначає силу зміни opinion уже після прийняття повідомлення.
+</info>
+  <turtleShapes>
+    <shape name="default" rotatable="true" editableColorIndex="0">
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="150" y="5"></point>
+        <point x="40" y="250"></point>
+        <point x="150" y="205"></point>
+        <point x="260" y="250"></point>
+      </polygon>
+    </shape>
+    <shape name="airplane" rotatable="true" editableColorIndex="0">
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="150" y="0"></point>
+        <point x="135" y="15"></point>
+        <point x="120" y="60"></point>
+        <point x="120" y="105"></point>
+        <point x="15" y="165"></point>
+        <point x="15" y="195"></point>
+        <point x="120" y="180"></point>
+        <point x="135" y="240"></point>
+        <point x="105" y="270"></point>
+        <point x="120" y="285"></point>
+        <point x="150" y="270"></point>
+        <point x="180" y="285"></point>
+        <point x="210" y="270"></point>
+        <point x="165" y="240"></point>
+        <point x="180" y="180"></point>
+        <point x="285" y="195"></point>
+        <point x="285" y="165"></point>
+        <point x="180" y="105"></point>
+        <point x="180" y="60"></point>
+        <point x="165" y="15"></point>
+      </polygon>
+    </shape>
+    <shape name="arrow" rotatable="true" editableColorIndex="0">
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="150" y="0"></point>
+        <point x="0" y="150"></point>
+        <point x="105" y="150"></point>
+        <point x="105" y="293"></point>
+        <point x="195" y="293"></point>
+        <point x="195" y="150"></point>
+        <point x="300" y="150"></point>
+      </polygon>
+    </shape>
+    <shape name="box" rotatable="false" editableColorIndex="0">
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="150" y="285"></point>
+        <point x="285" y="225"></point>
+        <point x="285" y="75"></point>
+        <point x="150" y="135"></point>
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="150" y="135"></point>
+        <point x="15" y="75"></point>
+        <point x="150" y="15"></point>
+        <point x="285" y="75"></point>
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="15" y="75"></point>
+        <point x="15" y="225"></point>
+        <point x="150" y="285"></point>
+        <point x="150" y="135"></point>
+      </polygon>
+      <line endX="150" startY="285" marked="false" color="255" endY="135" startX="150"></line>
+      <line endX="15" startY="135" marked="false" color="255" endY="75" startX="150"></line>
+      <line endX="285" startY="135" marked="false" color="255" endY="75" startX="150"></line>
+    </shape>
+    <shape name="bug" rotatable="true" editableColorIndex="0">
+      <circle x="96" y="182" marked="true" color="-1920102913" diameter="108" filled="true"></circle>
+      <circle x="110" y="127" marked="true" color="-1920102913" diameter="80" filled="true"></circle>
+      <circle x="110" y="75" marked="true" color="-1920102913" diameter="80" filled="true"></circle>
+      <line endX="80" startY="100" marked="true" color="-1920102913" endY="30" startX="150"></line>
+      <line endX="220" startY="100" marked="true" color="-1920102913" endY="30" startX="150"></line>
+    </shape>
+    <shape name="butterfly" rotatable="true" editableColorIndex="0">
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="150" y="165"></point>
+        <point x="209" y="199"></point>
+        <point x="225" y="225"></point>
+        <point x="225" y="255"></point>
+        <point x="195" y="270"></point>
+        <point x="165" y="255"></point>
+        <point x="150" y="240"></point>
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="150" y="165"></point>
+        <point x="89" y="198"></point>
+        <point x="75" y="225"></point>
+        <point x="75" y="255"></point>
+        <point x="105" y="270"></point>
+        <point x="135" y="255"></point>
+        <point x="150" y="240"></point>
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="139" y="148"></point>
+        <point x="100" y="105"></point>
+        <point x="55" y="90"></point>
+        <point x="25" y="90"></point>
+        <point x="10" y="105"></point>
+        <point x="10" y="135"></point>
+        <point x="25" y="180"></point>
+        <point x="40" y="195"></point>
+        <point x="85" y="194"></point>
+        <point x="139" y="163"></point>
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="162" y="150"></point>
+        <point x="200" y="105"></point>
+        <point x="245" y="90"></point>
+        <point x="275" y="90"></point>
+        <point x="290" y="105"></point>
+        <point x="290" y="135"></point>
+        <point x="275" y="180"></point>
+        <point x="260" y="195"></point>
+        <point x="215" y="195"></point>
+        <point x="162" y="165"></point>
+      </polygon>
+      <polygon color="255" filled="true" marked="false">
+        <point x="150" y="255"></point>
+        <point x="135" y="225"></point>
+        <point x="120" y="150"></point>
+        <point x="135" y="120"></point>
+        <point x="150" y="105"></point>
+        <point x="165" y="120"></point>
+        <point x="180" y="150"></point>
+        <point x="165" y="225"></point>
+      </polygon>
+      <circle x="135" y="90" marked="false" color="255" diameter="30" filled="true"></circle>
+      <line endX="195" startY="105" marked="false" color="255" endY="60" startX="150"></line>
+      <line endX="105" startY="105" marked="false" color="255" endY="60" startX="150"></line>
+    </shape>
+    <shape name="car" rotatable="false" editableColorIndex="0">
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="300" y="180"></point>
+        <point x="279" y="164"></point>
+        <point x="261" y="144"></point>
+        <point x="240" y="135"></point>
+        <point x="226" y="132"></point>
+        <point x="213" y="106"></point>
+        <point x="203" y="84"></point>
+        <point x="185" y="63"></point>
+        <point x="159" y="50"></point>
+        <point x="135" y="50"></point>
+        <point x="75" y="60"></point>
+        <point x="0" y="150"></point>
+        <point x="0" y="165"></point>
+        <point x="0" y="225"></point>
+        <point x="300" y="225"></point>
+        <point x="300" y="180"></point>
+      </polygon>
+      <circle x="180" y="180" marked="false" color="255" diameter="90" filled="true"></circle>
+      <circle x="30" y="180" marked="false" color="255" diameter="90" filled="true"></circle>
+      <polygon color="255" filled="true" marked="false">
+        <point x="162" y="80"></point>
+        <point x="132" y="78"></point>
+        <point x="134" y="135"></point>
+        <point x="209" y="135"></point>
+        <point x="194" y="105"></point>
+        <point x="189" y="96"></point>
+        <point x="180" y="89"></point>
+      </polygon>
+      <circle x="47" y="195" marked="true" color="-1920102913" diameter="58" filled="true"></circle>
+      <circle x="195" y="195" marked="true" color="-1920102913" diameter="58" filled="true"></circle>
+    </shape>
+    <shape name="circle" rotatable="false" editableColorIndex="0">
+      <circle x="0" y="0" marked="true" color="-1920102913" diameter="300" filled="true"></circle>
+    </shape>
+    <shape name="circle 2" rotatable="false" editableColorIndex="0">
+      <circle x="0" y="0" marked="true" color="-1920102913" diameter="300" filled="true"></circle>
+      <circle x="30" y="30" marked="false" color="255" diameter="240" filled="true"></circle>
+    </shape>
+    <shape name="cow" rotatable="false" editableColorIndex="0">
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="200" y="193"></point>
+        <point x="197" y="249"></point>
+        <point x="179" y="249"></point>
+        <point x="177" y="196"></point>
+        <point x="166" y="187"></point>
+        <point x="140" y="189"></point>
+        <point x="93" y="191"></point>
+        <point x="78" y="179"></point>
+        <point x="72" y="211"></point>
+        <point x="49" y="209"></point>
+        <point x="48" y="181"></point>
+        <point x="37" y="149"></point>
+        <point x="25" y="120"></point>
+        <point x="25" y="89"></point>
+        <point x="45" y="72"></point>
+        <point x="103" y="84"></point>
+        <point x="179" y="75"></point>
+        <point x="198" y="76"></point>
+        <point x="252" y="64"></point>
+        <point x="272" y="81"></point>
+        <point x="293" y="103"></point>
+        <point x="285" y="121"></point>
+        <point x="255" y="121"></point>
+        <point x="242" y="118"></point>
+        <point x="224" y="167"></point>
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="73" y="210"></point>
+        <point x="86" y="251"></point>
+        <point x="62" y="249"></point>
+        <point x="48" y="208"></point>
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="25" y="114"></point>
+        <point x="16" y="195"></point>
+        <point x="9" y="204"></point>
+        <point x="23" y="213"></point>
+        <point x="25" y="200"></point>
+        <point x="39" y="123"></point>
+      </polygon>
+    </shape>
+    <shape name="cylinder" rotatable="false" editableColorIndex="0">
+      <circle x="0" y="0" marked="true" color="-1920102913" diameter="300" filled="true"></circle>
+    </shape>
+    <shape name="dot" rotatable="false" editableColorIndex="0">
+      <circle x="90" y="90" marked="true" color="-1920102913" diameter="120" filled="true"></circle>
+    </shape>
+    <shape name="face happy" rotatable="false" editableColorIndex="0">
+      <circle x="8" y="8" marked="true" color="-1920102913" diameter="285" filled="true"></circle>
+      <circle x="60" y="75" marked="false" color="255" diameter="60" filled="true"></circle>
+      <circle x="180" y="75" marked="false" color="255" diameter="60" filled="true"></circle>
+      <polygon color="255" filled="true" marked="false">
+        <point x="150" y="255"></point>
+        <point x="90" y="239"></point>
+        <point x="62" y="213"></point>
+        <point x="47" y="191"></point>
+        <point x="67" y="179"></point>
+        <point x="90" y="203"></point>
+        <point x="109" y="218"></point>
+        <point x="150" y="225"></point>
+        <point x="192" y="218"></point>
+        <point x="210" y="203"></point>
+        <point x="227" y="181"></point>
+        <point x="251" y="194"></point>
+        <point x="236" y="217"></point>
+        <point x="212" y="240"></point>
+      </polygon>
+    </shape>
+    <shape name="face neutral" rotatable="false" editableColorIndex="0">
+      <circle x="8" y="7" marked="true" color="-1920102913" diameter="285" filled="true"></circle>
+      <circle x="60" y="75" marked="false" color="255" diameter="60" filled="true"></circle>
+      <circle x="180" y="75" marked="false" color="255" diameter="60" filled="true"></circle>
+      <rectangle endX="240" startY="195" marked="false" color="255" endY="225" startX="60" filled="true"></rectangle>
+    </shape>
+    <shape name="face sad" rotatable="false" editableColorIndex="0">
+      <circle x="8" y="8" marked="true" color="-1920102913" diameter="285" filled="true"></circle>
+      <circle x="60" y="75" marked="false" color="255" diameter="60" filled="true"></circle>
+      <circle x="180" y="75" marked="false" color="255" diameter="60" filled="true"></circle>
+      <polygon color="255" filled="true" marked="false">
+        <point x="150" y="168"></point>
+        <point x="90" y="184"></point>
+        <point x="62" y="210"></point>
+        <point x="47" y="232"></point>
+        <point x="67" y="244"></point>
+        <point x="90" y="220"></point>
+        <point x="109" y="205"></point>
+        <point x="150" y="198"></point>
+        <point x="192" y="205"></point>
+        <point x="210" y="220"></point>
+        <point x="227" y="242"></point>
+        <point x="251" y="229"></point>
+        <point x="236" y="206"></point>
+        <point x="212" y="183"></point>
+      </polygon>
+    </shape>
+    <shape name="fish" rotatable="false" editableColorIndex="0">
+      <polygon color="-1" filled="true" marked="false">
+        <point x="44" y="131"></point>
+        <point x="21" y="87"></point>
+        <point x="15" y="86"></point>
+        <point x="0" y="120"></point>
+        <point x="15" y="150"></point>
+        <point x="0" y="180"></point>
+        <point x="13" y="214"></point>
+        <point x="20" y="212"></point>
+        <point x="45" y="166"></point>
+      </polygon>
+      <polygon color="-1" filled="true" marked="false">
+        <point x="135" y="195"></point>
+        <point x="119" y="235"></point>
+        <point x="95" y="218"></point>
+        <point x="76" y="210"></point>
+        <point x="46" y="204"></point>
+        <point x="60" y="165"></point>
+      </polygon>
+      <polygon color="-1" filled="true" marked="false">
+        <point x="75" y="45"></point>
+        <point x="83" y="77"></point>
+        <point x="71" y="103"></point>
+        <point x="86" y="114"></point>
+        <point x="166" y="78"></point>
+        <point x="135" y="60"></point>
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="30" y="136"></point>
+        <point x="151" y="77"></point>
+        <point x="226" y="81"></point>
+        <point x="280" y="119"></point>
+        <point x="292" y="146"></point>
+        <point x="292" y="160"></point>
+        <point x="287" y="170"></point>
+        <point x="270" y="195"></point>
+        <point x="195" y="210"></point>
+        <point x="151" y="212"></point>
+        <point x="30" y="166"></point>
+      </polygon>
+      <circle x="215" y="106" marked="false" color="255" diameter="30" filled="true"></circle>
+    </shape>
+    <shape name="flag" rotatable="false" editableColorIndex="0">
+      <rectangle endX="75" startY="15" marked="true" color="-1920102913" endY="300" startX="60" filled="true"></rectangle>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="90" y="150"></point>
+        <point x="270" y="90"></point>
+        <point x="90" y="30"></point>
+      </polygon>
+      <line endX="90" startY="135" marked="true" color="-1920102913" endY="135" startX="75"></line>
+      <line endX="90" startY="45" marked="true" color="-1920102913" endY="45" startX="75"></line>
+    </shape>
+    <shape name="flower" rotatable="false" editableColorIndex="0">
+      <polygon color="1504722175" filled="true" marked="false">
+        <point x="135" y="120"></point>
+        <point x="165" y="165"></point>
+        <point x="180" y="210"></point>
+        <point x="180" y="240"></point>
+        <point x="150" y="300"></point>
+        <point x="165" y="300"></point>
+        <point x="195" y="240"></point>
+        <point x="195" y="195"></point>
+        <point x="165" y="135"></point>
+      </polygon>
+      <circle x="85" y="132" marked="true" color="-1920102913" diameter="38" filled="true"></circle>
+      <circle x="130" y="147" marked="true" color="-1920102913" diameter="38" filled="true"></circle>
+      <circle x="192" y="85" marked="true" color="-1920102913" diameter="38" filled="true"></circle>
+      <circle x="85" y="40" marked="true" color="-1920102913" diameter="38" filled="true"></circle>
+      <circle x="177" y="40" marked="true" color="-1920102913" diameter="38" filled="true"></circle>
+      <circle x="177" y="132" marked="true" color="-1920102913" diameter="38" filled="true"></circle>
+      <circle x="70" y="85" marked="true" color="-1920102913" diameter="38" filled="true"></circle>
+      <circle x="130" y="25" marked="true" color="-1920102913" diameter="38" filled="true"></circle>
+      <circle x="96" y="51" marked="true" color="-1920102913" diameter="108" filled="true"></circle>
+      <circle x="113" y="68" marked="false" color="255" diameter="74" filled="true"></circle>
+      <polygon color="1504722175" filled="true" marked="false">
+        <point x="189" y="233"></point>
+        <point x="219" y="188"></point>
+        <point x="249" y="173"></point>
+        <point x="279" y="188"></point>
+        <point x="234" y="218"></point>
+      </polygon>
+      <polygon color="1504722175" filled="true" marked="false">
+        <point x="180" y="255"></point>
+        <point x="150" y="210"></point>
+        <point x="105" y="210"></point>
+        <point x="75" y="240"></point>
+        <point x="135" y="240"></point>
+      </polygon>
+    </shape>
+    <shape name="house" rotatable="false" editableColorIndex="0">
+      <rectangle endX="255" startY="120" marked="true" color="-1920102913" endY="285" startX="45" filled="true"></rectangle>
+      <rectangle endX="180" startY="210" marked="false" color="255" endY="285" startX="120" filled="true"></rectangle>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="15" y="120"></point>
+        <point x="150" y="15"></point>
+        <point x="285" y="120"></point>
+      </polygon>
+      <line endX="270" startY="120" marked="false" color="255" endY="120" startX="30"></line>
+    </shape>
+    <shape name="leaf" rotatable="false" editableColorIndex="0">
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="150" y="210"></point>
+        <point x="135" y="195"></point>
+        <point x="120" y="210"></point>
+        <point x="60" y="210"></point>
+        <point x="30" y="195"></point>
+        <point x="60" y="180"></point>
+        <point x="60" y="165"></point>
+        <point x="15" y="135"></point>
+        <point x="30" y="120"></point>
+        <point x="15" y="105"></point>
+        <point x="40" y="104"></point>
+        <point x="45" y="90"></point>
+        <point x="60" y="90"></point>
+        <point x="90" y="105"></point>
+        <point x="105" y="120"></point>
+        <point x="120" y="120"></point>
+        <point x="105" y="60"></point>
+        <point x="120" y="60"></point>
+        <point x="135" y="30"></point>
+        <point x="150" y="15"></point>
+        <point x="165" y="30"></point>
+        <point x="180" y="60"></point>
+        <point x="195" y="60"></point>
+        <point x="180" y="120"></point>
+        <point x="195" y="120"></point>
+        <point x="210" y="105"></point>
+        <point x="240" y="90"></point>
+        <point x="255" y="90"></point>
+        <point x="263" y="104"></point>
+        <point x="285" y="105"></point>
+        <point x="270" y="120"></point>
+        <point x="285" y="135"></point>
+        <point x="240" y="165"></point>
+        <point x="240" y="180"></point>
+        <point x="270" y="195"></point>
+        <point x="240" y="210"></point>
+        <point x="180" y="210"></point>
+        <point x="165" y="195"></point>
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="135" y="195"></point>
+        <point x="135" y="240"></point>
+        <point x="120" y="255"></point>
+        <point x="105" y="255"></point>
+        <point x="105" y="285"></point>
+        <point x="135" y="285"></point>
+        <point x="165" y="240"></point>
+        <point x="165" y="195"></point>
+      </polygon>
+    </shape>
+    <shape name="line" rotatable="true" editableColorIndex="0">
+      <line endX="150" startY="0" marked="true" color="-1920102913" endY="300" startX="150"></line>
+    </shape>
+    <shape name="line half" rotatable="true" editableColorIndex="0">
+      <line endX="150" startY="0" marked="true" color="-1920102913" endY="150" startX="150"></line>
+    </shape>
+    <shape name="pentagon" rotatable="false" editableColorIndex="0">
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="150" y="15"></point>
+        <point x="15" y="120"></point>
+        <point x="60" y="285"></point>
+        <point x="240" y="285"></point>
+        <point x="285" y="120"></point>
+      </polygon>
+    </shape>
+    <shape name="person" rotatable="false" editableColorIndex="0">
+      <circle x="110" y="5" marked="true" color="-1920102913" diameter="80" filled="true"></circle>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="105" y="90"></point>
+        <point x="120" y="195"></point>
+        <point x="90" y="285"></point>
+        <point x="105" y="300"></point>
+        <point x="135" y="300"></point>
+        <point x="150" y="225"></point>
+        <point x="165" y="300"></point>
+        <point x="195" y="300"></point>
+        <point x="210" y="285"></point>
+        <point x="180" y="195"></point>
+        <point x="195" y="90"></point>
+      </polygon>
+      <rectangle endX="172" startY="79" marked="true" color="-1920102913" endY="94" startX="127" filled="true"></rectangle>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="195" y="90"></point>
+        <point x="240" y="150"></point>
+        <point x="225" y="180"></point>
+        <point x="165" y="105"></point>
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="105" y="90"></point>
+        <point x="60" y="150"></point>
+        <point x="75" y="180"></point>
+        <point x="135" y="105"></point>
+      </polygon>
+    </shape>
+    <shape name="plant" rotatable="false" editableColorIndex="0">
+      <rectangle endX="165" startY="90" marked="true" color="-1920102913" endY="300" startX="135" filled="true"></rectangle>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="135" y="255"></point>
+        <point x="90" y="210"></point>
+        <point x="45" y="195"></point>
+        <point x="75" y="255"></point>
+        <point x="135" y="285"></point>
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="165" y="255"></point>
+        <point x="210" y="210"></point>
+        <point x="255" y="195"></point>
+        <point x="225" y="255"></point>
+        <point x="165" y="285"></point>
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="135" y="180"></point>
+        <point x="90" y="135"></point>
+        <point x="45" y="120"></point>
+        <point x="75" y="180"></point>
+        <point x="135" y="210"></point>
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="165" y="180"></point>
+        <point x="165" y="210"></point>
+        <point x="225" y="180"></point>
+        <point x="255" y="120"></point>
+        <point x="210" y="135"></point>
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="135" y="105"></point>
+        <point x="90" y="60"></point>
+        <point x="45" y="45"></point>
+        <point x="75" y="105"></point>
+        <point x="135" y="135"></point>
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="165" y="105"></point>
+        <point x="165" y="135"></point>
+        <point x="225" y="105"></point>
+        <point x="255" y="45"></point>
+        <point x="210" y="60"></point>
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="135" y="90"></point>
+        <point x="120" y="45"></point>
+        <point x="150" y="15"></point>
+        <point x="180" y="45"></point>
+        <point x="165" y="90"></point>
+      </polygon>
+    </shape>
+    <shape name="sheep" rotatable="false" editableColorIndex="15">
+      <circle x="203" y="65" marked="true" color="-1" diameter="88" filled="true"></circle>
+      <circle x="70" y="65" marked="true" color="-1" diameter="162" filled="true"></circle>
+      <circle x="150" y="105" marked="true" color="-1" diameter="120" filled="true"></circle>
+      <polygon color="-1920102913" filled="true" marked="false">
+        <point x="218" y="120"></point>
+        <point x="240" y="165"></point>
+        <point x="255" y="165"></point>
+        <point x="278" y="120"></point>
+      </polygon>
+      <circle x="214" y="72" marked="false" color="-1920102913" diameter="67" filled="true"></circle>
+      <rectangle endX="179" startY="223" marked="true" color="-1" endY="298" startX="164" filled="true"></rectangle>
+      <polygon color="-1" filled="true" marked="true">
+        <point x="45" y="285"></point>
+        <point x="30" y="285"></point>
+        <point x="30" y="240"></point>
+        <point x="15" y="195"></point>
+        <point x="45" y="210"></point>
+      </polygon>
+      <circle x="3" y="83" marked="true" color="-1" diameter="150" filled="true"></circle>
+      <rectangle endX="80" startY="221" marked="true" color="-1" endY="296" startX="65" filled="true"></rectangle>
+      <polygon color="-1" filled="true" marked="true">
+        <point x="195" y="285"></point>
+        <point x="210" y="285"></point>
+        <point x="210" y="240"></point>
+        <point x="240" y="210"></point>
+        <point x="195" y="210"></point>
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="false">
+        <point x="276" y="85"></point>
+        <point x="285" y="105"></point>
+        <point x="302" y="99"></point>
+        <point x="294" y="83"></point>
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="false">
+        <point x="219" y="85"></point>
+        <point x="210" y="105"></point>
+        <point x="193" y="99"></point>
+        <point x="201" y="83"></point>
+      </polygon>
+    </shape>
+    <shape name="square" rotatable="false" editableColorIndex="0">
+      <rectangle endX="270" startY="30" marked="true" color="-1920102913" endY="270" startX="30" filled="true"></rectangle>
+    </shape>
+    <shape name="square 2" rotatable="false" editableColorIndex="0">
+      <rectangle endX="270" startY="30" marked="true" color="-1920102913" endY="270" startX="30" filled="true"></rectangle>
+      <rectangle endX="240" startY="60" marked="false" color="255" endY="240" startX="60" filled="true"></rectangle>
+    </shape>
+    <shape name="star" rotatable="false" editableColorIndex="0">
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="151" y="1"></point>
+        <point x="185" y="108"></point>
+        <point x="298" y="108"></point>
+        <point x="207" y="175"></point>
+        <point x="242" y="282"></point>
+        <point x="151" y="216"></point>
+        <point x="59" y="282"></point>
+        <point x="94" y="175"></point>
+        <point x="3" y="108"></point>
+        <point x="116" y="108"></point>
+      </polygon>
+    </shape>
+    <shape name="target" rotatable="false" editableColorIndex="0">
+      <circle x="0" y="0" marked="true" color="-1920102913" diameter="300" filled="true"></circle>
+      <circle x="30" y="30" marked="false" color="255" diameter="240" filled="true"></circle>
+      <circle x="60" y="60" marked="true" color="-1920102913" diameter="180" filled="true"></circle>
+      <circle x="90" y="90" marked="false" color="255" diameter="120" filled="true"></circle>
+      <circle x="120" y="120" marked="true" color="-1920102913" diameter="60" filled="true"></circle>
+    </shape>
+    <shape name="tree" rotatable="false" editableColorIndex="0">
+      <circle x="118" y="3" marked="true" color="-1920102913" diameter="94" filled="true"></circle>
+      <rectangle endX="180" startY="195" marked="false" color="-1653716737" endY="300" startX="120" filled="true"></rectangle>
+      <circle x="65" y="21" marked="true" color="-1920102913" diameter="108" filled="true"></circle>
+      <circle x="116" y="41" marked="true" color="-1920102913" diameter="127" filled="true"></circle>
+      <circle x="45" y="90" marked="true" color="-1920102913" diameter="120" filled="true"></circle>
+      <circle x="104" y="74" marked="true" color="-1920102913" diameter="152" filled="true"></circle>
+    </shape>
+    <shape name="triangle" rotatable="false" editableColorIndex="0">
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="150" y="30"></point>
+        <point x="15" y="255"></point>
+        <point x="285" y="255"></point>
+      </polygon>
+    </shape>
+    <shape name="triangle 2" rotatable="false" editableColorIndex="0">
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="150" y="30"></point>
+        <point x="15" y="255"></point>
+        <point x="285" y="255"></point>
+      </polygon>
+      <polygon color="255" filled="true" marked="false">
+        <point x="151" y="99"></point>
+        <point x="225" y="223"></point>
+        <point x="75" y="224"></point>
+      </polygon>
+    </shape>
+    <shape name="truck" rotatable="false" editableColorIndex="0">
+      <rectangle endX="195" startY="45" marked="true" color="-1920102913" endY="187" startX="4" filled="true"></rectangle>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="296" y="193"></point>
+        <point x="296" y="150"></point>
+        <point x="259" y="134"></point>
+        <point x="244" y="104"></point>
+        <point x="208" y="104"></point>
+        <point x="207" y="194"></point>
+      </polygon>
+      <rectangle endX="195" startY="60" marked="false" color="-1" endY="105" startX="195" filled="true"></rectangle>
+      <polygon color="255" filled="true" marked="false">
+        <point x="238" y="112"></point>
+        <point x="252" y="141"></point>
+        <point x="219" y="141"></point>
+        <point x="218" y="112"></point>
+      </polygon>
+      <circle x="234" y="174" marked="false" color="255" diameter="42" filled="true"></circle>
+      <rectangle endX="214" startY="185" marked="true" color="-1920102913" endY="194" startX="181" filled="true"></rectangle>
+      <circle x="144" y="174" marked="false" color="255" diameter="42" filled="true"></circle>
+      <circle x="24" y="174" marked="false" color="255" diameter="42" filled="true"></circle>
+      <circle x="24" y="174" marked="true" color="-1920102913" diameter="42" filled="false"></circle>
+      <circle x="144" y="174" marked="true" color="-1920102913" diameter="42" filled="false"></circle>
+      <circle x="234" y="174" marked="true" color="-1920102913" diameter="42" filled="false"></circle>
+    </shape>
+    <shape name="turtle" rotatable="true" editableColorIndex="0">
+      <polygon color="1504722175" filled="true" marked="false">
+        <point x="215" y="204"></point>
+        <point x="240" y="233"></point>
+        <point x="246" y="254"></point>
+        <point x="228" y="266"></point>
+        <point x="215" y="252"></point>
+        <point x="193" y="210"></point>
+      </polygon>
+      <polygon color="1504722175" filled="true" marked="false">
+        <point x="195" y="90"></point>
+        <point x="225" y="75"></point>
+        <point x="245" y="75"></point>
+        <point x="260" y="89"></point>
+        <point x="269" y="108"></point>
+        <point x="261" y="124"></point>
+        <point x="240" y="105"></point>
+        <point x="225" y="105"></point>
+        <point x="210" y="105"></point>
+      </polygon>
+      <polygon color="1504722175" filled="true" marked="false">
+        <point x="105" y="90"></point>
+        <point x="75" y="75"></point>
+        <point x="55" y="75"></point>
+        <point x="40" y="89"></point>
+        <point x="31" y="108"></point>
+        <point x="39" y="124"></point>
+        <point x="60" y="105"></point>
+        <point x="75" y="105"></point>
+        <point x="90" y="105"></point>
+      </polygon>
+      <polygon color="1504722175" filled="true" marked="false">
+        <point x="132" y="85"></point>
+        <point x="134" y="64"></point>
+        <point x="107" y="51"></point>
+        <point x="108" y="17"></point>
+        <point x="150" y="2"></point>
+        <point x="192" y="18"></point>
+        <point x="192" y="52"></point>
+        <point x="169" y="65"></point>
+        <point x="172" y="87"></point>
+      </polygon>
+      <polygon color="1504722175" filled="true" marked="false">
+        <point x="85" y="204"></point>
+        <point x="60" y="233"></point>
+        <point x="54" y="254"></point>
+        <point x="72" y="266"></point>
+        <point x="85" y="252"></point>
+        <point x="107" y="210"></point>
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="119" y="75"></point>
+        <point x="179" y="75"></point>
+        <point x="209" y="101"></point>
+        <point x="224" y="135"></point>
+        <point x="220" y="225"></point>
+        <point x="175" y="261"></point>
+        <point x="128" y="261"></point>
+        <point x="81" y="224"></point>
+        <point x="74" y="135"></point>
+        <point x="88" y="99"></point>
+      </polygon>
+    </shape>
+    <shape name="wheel" rotatable="false" editableColorIndex="0">
+      <circle x="3" y="3" marked="true" color="-1920102913" diameter="294" filled="true"></circle>
+      <circle x="30" y="30" marked="false" color="255" diameter="240" filled="true"></circle>
+      <line endX="150" startY="285" marked="true" color="-1920102913" endY="15" startX="150"></line>
+      <line endX="285" startY="150" marked="true" color="-1920102913" endY="150" startX="15"></line>
+      <circle x="120" y="120" marked="true" color="-1920102913" diameter="60" filled="true"></circle>
+      <line endX="79" startY="40" marked="true" color="-1920102913" endY="269" startX="216"></line>
+      <line endX="269" startY="84" marked="true" color="-1920102913" endY="221" startX="40"></line>
+      <line endX="269" startY="216" marked="true" color="-1920102913" endY="79" startX="40"></line>
+      <line endX="221" startY="40" marked="true" color="-1920102913" endY="269" startX="84"></line>
+    </shape>
+    <shape name="wolf" rotatable="false" editableColorIndex="0">
+      <polygon color="255" filled="true" marked="false">
+        <point x="253" y="133"></point>
+        <point x="245" y="131"></point>
+        <point x="245" y="133"></point>
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="2" y="194"></point>
+        <point x="13" y="197"></point>
+        <point x="30" y="191"></point>
+        <point x="38" y="193"></point>
+        <point x="38" y="205"></point>
+        <point x="20" y="226"></point>
+        <point x="20" y="257"></point>
+        <point x="27" y="265"></point>
+        <point x="38" y="266"></point>
+        <point x="40" y="260"></point>
+        <point x="31" y="253"></point>
+        <point x="31" y="230"></point>
+        <point x="60" y="206"></point>
+        <point x="68" y="198"></point>
+        <point x="75" y="209"></point>
+        <point x="66" y="228"></point>
+        <point x="65" y="243"></point>
+        <point x="82" y="261"></point>
+        <point x="84" y="268"></point>
+        <point x="100" y="267"></point>
+        <point x="103" y="261"></point>
+        <point x="77" y="239"></point>
+        <point x="79" y="231"></point>
+        <point x="100" y="207"></point>
+        <point x="98" y="196"></point>
+        <point x="119" y="201"></point>
+        <point x="143" y="202"></point>
+        <point x="160" y="195"></point>
+        <point x="166" y="210"></point>
+        <point x="172" y="213"></point>
+        <point x="173" y="238"></point>
+        <point x="167" y="251"></point>
+        <point x="160" y="248"></point>
+        <point x="154" y="265"></point>
+        <point x="169" y="264"></point>
+        <point x="178" y="247"></point>
+        <point x="186" y="240"></point>
+        <point x="198" y="260"></point>
+        <point x="200" y="271"></point>
+        <point x="217" y="271"></point>
+        <point x="219" y="262"></point>
+        <point x="207" y="258"></point>
+        <point x="195" y="230"></point>
+        <point x="192" y="198"></point>
+        <point x="210" y="184"></point>
+        <point x="227" y="164"></point>
+        <point x="242" y="144"></point>
+        <point x="259" y="145"></point>
+        <point x="284" y="151"></point>
+        <point x="277" y="141"></point>
+        <point x="293" y="140"></point>
+        <point x="299" y="134"></point>
+        <point x="297" y="127"></point>
+        <point x="273" y="119"></point>
+        <point x="270" y="105"></point>
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="-1" y="195"></point>
+        <point x="14" y="180"></point>
+        <point x="36" y="166"></point>
+        <point x="40" y="153"></point>
+        <point x="53" y="140"></point>
+        <point x="82" y="131"></point>
+        <point x="134" y="133"></point>
+        <point x="159" y="126"></point>
+        <point x="188" y="115"></point>
+        <point x="227" y="108"></point>
+        <point x="236" y="102"></point>
+        <point x="238" y="98"></point>
+        <point x="268" y="86"></point>
+        <point x="269" y="92"></point>
+        <point x="281" y="87"></point>
+        <point x="269" y="103"></point>
+        <point x="269" y="113"></point>
+      </polygon>
+    </shape>
+    <shape name="x" rotatable="false" editableColorIndex="0">
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="270" y="75"></point>
+        <point x="225" y="30"></point>
+        <point x="30" y="225"></point>
+        <point x="75" y="270"></point>
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="30" y="75"></point>
+        <point x="75" y="30"></point>
+        <point x="270" y="225"></point>
+        <point x="225" y="270"></point>
+      </polygon>
+    </shape>
+  </turtleShapes>
+  <linkShapes>
+    <shape name="default" curviness="0.0">
+      <lines>
+        <line x="-0.2" visible="false">
+          <dash value="0.0"></dash>
+          <dash value="1.0"></dash>
+        </line>
+        <line x="0.0" visible="true">
+          <dash value="1.0"></dash>
+          <dash value="0.0"></dash>
+        </line>
+        <line x="0.2" visible="false">
+          <dash value="0.0"></dash>
+          <dash value="1.0"></dash>
+        </line>
+      </lines>
+      <indicator>
+        <shape name="link direction" rotatable="true" editableColorIndex="0">
+          <line endX="90" startY="150" marked="true" color="-1920102913" endY="180" startX="150"></line>
+          <line endX="210" startY="150" marked="true" color="-1920102913" endY="180" startX="150"></line>
+        </shape>
+      </indicator>
+    </shape>
+  </linkShapes>
+  <previewCommands>setup repeat 75 [ go ]</previewCommands>
+  <experiments>
+    <experiment name="regression-test" repetitions="1" sequentialRunOrder="true" runMetricsEveryStep="false">
+      <setup>random-seed 12345
+setup</setup>
+      <go>go</go>
+      <exitCondition><![CDATA[ticks >= experiment-end]]></exitCondition>
+      <metrics>
+        <metric>high-reward-crowding-out-effect</metric>
+        <metric>low-reward-persistence-effect</metric>
+        <metric>final-withdrawal-choice-rate "control"</metric>
+        <metric>final-withdrawal-choice-rate "low-salience"</metric>
+        <metric>final-withdrawal-choice-rate "high-salience"</metric>
+        <metric>mean-intrinsic-motivation "high-salience"</metric>
+        <metric>mean-habit "high-salience"</metric>
+        <metric>persistence "control"</metric>
+        <metric>persistence "low-salience"</metric>
+        <metric>persistence "high-salience"</metric>
+        <metric>persistence-index "control"</metric>
+        <metric>persistence-index "low-salience"</metric>
+        <metric>persistence-index "high-salience"</metric>
+      </metrics>
+      <constants>
+        <enumeratedValueSet variable="number-of-shoppers">
+          <value value="900"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="reward-cycles">
+          <value value="1"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="reward-duration">
+          <value value="60"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="withdrawal-duration">
+          <value value="60"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="low-reward-salience">
+          <value value="0.3"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="high-reward-salience">
+          <value value="0.9"></value>
+        </enumeratedValueSet>
+      </constants>
+    </experiment>
+    <experiment name="E1 reward magnitude and crowding-out" repetitions="30" sequentialRunOrder="true" runMetricsEveryStep="false">
+      <setup>setup</setup>
+      <go>go</go>
+      <exitCondition>simulation-finished?</exitCondition>
+      <metrics>
+        <metric>choice-rate "control" "baseline"</metric>
+        <metric>choice-rate "low-salience" "baseline"</metric>
+        <metric>choice-rate "high-salience" "baseline"</metric>
+        <metric>choice-rate "control" "reward"</metric>
+        <metric>choice-rate "low-salience" "reward"</metric>
+        <metric>choice-rate "high-salience" "reward"</metric>
+        <metric>persistence "control"</metric>
+        <metric>persistence "low-salience"</metric>
+        <metric>persistence "high-salience"</metric>
+        <metric>persistence-index "control"</metric>
+        <metric>persistence-index "low-salience"</metric>
+        <metric>persistence-index "high-salience"</metric>
+        <metric>mean-intrinsic-motivation "control"</metric>
+        <metric>mean-intrinsic-motivation "low-salience"</metric>
+        <metric>mean-intrinsic-motivation "high-salience"</metric>
+        <metric>mean-habit "control"</metric>
+        <metric>mean-habit "low-salience"</metric>
+        <metric>mean-habit "high-salience"</metric>
+        <metric>high-reward-crowding-out-effect</metric>
+        <metric>low-reward-persistence-effect</metric>
+        <metric>high-reward-withdrawal-drop</metric>
+        <metric>low-reward-withdrawal-drop</metric>
+        <metric>high-reward-retention-ratio</metric>
+        <metric>low-reward-retention-ratio</metric>
+      </metrics>
+      <constants>
+        <enumeratedValueSet variable="number-of-shoppers">
+          <value value="1200"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="reward-cycles">
+          <value value="1"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="reward-duration">
+          <value value="60"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="withdrawal-duration">
+          <value value="80"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="low-reward-salience">
+          <value value="0.15"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="high-reward-salience">
+          <value value="0.45"></value>
+          <value value="0.55"></value>
+          <value value="0.6"></value>
+          <value value="0.65"></value>
+          <value value="0.75"></value>
+          <value value="0.85"></value>
+          <value value="0.95"></value>
+        </enumeratedValueSet>
+      </constants>
+    </experiment>
+    <experiment name="E2 reward magnitude x duration" repetitions="30" sequentialRunOrder="true" runMetricsEveryStep="false">
+      <setup>setup</setup>
+      <go>go</go>
+      <exitCondition>simulation-finished?</exitCondition>
+      <metrics>
+        <metric>choice-rate "control" "baseline"</metric>
+        <metric>choice-rate "low-salience" "baseline"</metric>
+        <metric>choice-rate "high-salience" "baseline"</metric>
+        <metric>choice-rate "control" "reward"</metric>
+        <metric>choice-rate "low-salience" "reward"</metric>
+        <metric>choice-rate "high-salience" "reward"</metric>
+        <metric>persistence "control"</metric>
+        <metric>persistence "low-salience"</metric>
+        <metric>persistence "high-salience"</metric>
+        <metric>persistence-index "control"</metric>
+        <metric>persistence-index "low-salience"</metric>
+        <metric>persistence-index "high-salience"</metric>
+        <metric>mean-intrinsic-motivation "control"</metric>
+        <metric>mean-intrinsic-motivation "low-salience"</metric>
+        <metric>mean-intrinsic-motivation "high-salience"</metric>
+        <metric>mean-habit "control"</metric>
+        <metric>mean-habit "low-salience"</metric>
+        <metric>mean-habit "high-salience"</metric>
+        <metric>high-reward-crowding-out-effect</metric>
+        <metric>low-reward-persistence-effect</metric>
+        <metric>high-reward-withdrawal-drop</metric>
+        <metric>low-reward-withdrawal-drop</metric>
+        <metric>high-reward-retention-ratio</metric>
+        <metric>low-reward-retention-ratio</metric>
+      </metrics>
+      <constants>
+        <enumeratedValueSet variable="number-of-shoppers">
+          <value value="1200"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="reward-cycles">
+          <value value="1"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="reward-duration">
+          <value value="20"></value>
+          <value value="40"></value>
+          <value value="60"></value>
+          <value value="90"></value>
+          <value value="120"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="withdrawal-duration">
+          <value value="80"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="low-reward-salience">
+          <value value="0.15"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="high-reward-salience">
+          <value value="0.55"></value>
+          <value value="0.65"></value>
+          <value value="0.75"></value>
+          <value value="0.85"></value>
+          <value value="0.95"></value>
+        </enumeratedValueSet>
+      </constants>
+    </experiment>
+    <experiment name="E3 repeated campaign structure" repetitions="30" sequentialRunOrder="true" runMetricsEveryStep="false">
+      <setup>setup</setup>
+      <go>go</go>
+      <exitCondition>simulation-finished?</exitCondition>
+      <metrics>
+        <metric>choice-rate "control" "baseline"</metric>
+        <metric>choice-rate "low-salience" "baseline"</metric>
+        <metric>choice-rate "high-salience" "baseline"</metric>
+        <metric>choice-rate "control" "reward"</metric>
+        <metric>choice-rate "low-salience" "reward"</metric>
+        <metric>choice-rate "high-salience" "reward"</metric>
+        <metric>persistence "control"</metric>
+        <metric>persistence "low-salience"</metric>
+        <metric>persistence "high-salience"</metric>
+        <metric>persistence-index "control"</metric>
+        <metric>persistence-index "low-salience"</metric>
+        <metric>persistence-index "high-salience"</metric>
+        <metric>mean-intrinsic-motivation "control"</metric>
+        <metric>mean-intrinsic-motivation "low-salience"</metric>
+        <metric>mean-intrinsic-motivation "high-salience"</metric>
+        <metric>mean-habit "control"</metric>
+        <metric>mean-habit "low-salience"</metric>
+        <metric>mean-habit "high-salience"</metric>
+        <metric>high-reward-crowding-out-effect</metric>
+        <metric>low-reward-persistence-effect</metric>
+        <metric>high-reward-withdrawal-drop</metric>
+        <metric>low-reward-withdrawal-drop</metric>
+        <metric>high-reward-retention-ratio</metric>
+        <metric>low-reward-retention-ratio</metric>
+      </metrics>
+      <constants>
+        <enumeratedValueSet variable="number-of-shoppers">
+          <value value="1200"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="reward-cycles">
+          <value value="1"></value>
+          <value value="2"></value>
+          <value value="3"></value>
+          <value value="4"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="reward-duration">
+          <value value="20"></value>
+          <value value="40"></value>
+          <value value="60"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="withdrawal-duration">
+          <value value="20"></value>
+          <value value="40"></value>
+          <value value="80"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="low-reward-salience">
+          <value value="0.15"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="high-reward-salience">
+          <value value="0.75"></value>
+          <value value="0.9"></value>
+        </enumeratedValueSet>
+      </constants>
+    </experiment>
+    <experiment name="E4 statistical forecasting benchmark" repetitions="30" sequentialRunOrder="true" runMetricsEveryStep="true">
+      <setup>setup</setup>
+      <go>go</go>
+      <exitCondition>simulation-finished?</exitCondition>
+      <metrics>
+        <metric>current-phase</metric>
+        <metric>reward-active?</metric>
+        <metric>current-choice-rate "control"</metric>
+        <metric>current-choice-rate "low-salience"</metric>
+        <metric>current-choice-rate "high-salience"</metric>
+        <metric>mean-habit "control"</metric>
+        <metric>mean-habit "low-salience"</metric>
+        <metric>mean-habit "high-salience"</metric>
+        <metric>mean-intrinsic-motivation "control"</metric>
+        <metric>mean-intrinsic-motivation "low-salience"</metric>
+        <metric>mean-intrinsic-motivation "high-salience"</metric>
+      </metrics>
+      <constants>
+        <enumeratedValueSet variable="number-of-shoppers">
+          <value value="1000"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="reward-cycles">
+          <value value="1"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="reward-duration">
+          <value value="80"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="withdrawal-duration">
+          <value value="80"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="low-reward-salience">
+          <value value="0.15"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="high-reward-salience">
+          <value value="0.55"></value>
+          <value value="0.75"></value>
+          <value value="0.9"></value>
+        </enumeratedValueSet>
+      </constants>
+    </experiment>
+    <experiment name="E5 WOM withdrawal compensation calibration" repetitions="30" sequentialRunOrder="true" runMetricsEveryStep="false">
+      <setup>setup</setup>
+      <go>go</go>
+      <exitCondition>simulation-finished?</exitCondition>
+      <metrics>
+        <metric>choice-rate "high-salience" "baseline"</metric>
+        <metric>choice-rate "high-salience" "reward"</metric>
+        <metric>final-withdrawal-choice-rate "high-salience"</metric>
+        <metric>high-reward-withdrawal-drop</metric>
+        <metric>high-reward-retention-ratio</metric>
+        <metric>persistence-index "high-salience"</metric>
+        <metric>mean-intrinsic-motivation "high-salience"</metric>
+        <metric>mean-habit "high-salience"</metric>
+        <metric>mean-opinion "high-salience"</metric>
+        <metric>wom-speaker-share</metric>
+        <metric>wom-receiver-share</metric>
+        <metric>mean-absolute-wom-opinion-change</metric>
+        <metric>mean-network-degree</metric>
+      </metrics>
+      <constants>
+        <enumeratedValueSet variable="number-of-shoppers">
+          <value value="1200"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="reward-cycles">
+          <value value="1"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="reward-duration">
+          <value value="60"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="withdrawal-duration">
+          <value value="80"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="low-reward-salience">
+          <value value="0.15"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="high-reward-salience">
+          <value value="0.75"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="wom-on?">
+          <value value="false"></value>
+          <value value="true"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="network-topology">
+          <value value="&quot;small-world&quot;"></value>
+          <value value="&quot;preferential-attachment&quot;"></value>
+          <value value="&quot;random&quot;"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="network-degree">
+          <value value="4"></value>
+          <value value="8"></value>
+          <value value="12"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="rewiring-probability">
+          <value value="0.1"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="purchase-deliberation-mode">
+          <value value="&quot;low-involvement&quot;"></value>
+          <value value="&quot;high-involvement&quot;"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="confidence-bound">
+          <value value="0.3"></value>
+          <value value="0.6"></value>
+          <value value="1"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="show-network?">
+          <value value="false"></value>
+        </enumeratedValueSet>
+      </constants>
+    </experiment>
+  </experiments>
+</model>
