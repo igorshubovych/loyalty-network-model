@@ -1,6 +1,8 @@
 <?xml version="1.0" encoding="utf-8"?>
 <model version="NetLogo 7.0.4" snapToGrid="true">
-  <code><![CDATA[breed [shoppers shopper]
+  <code><![CDATA[extensions [nw]
+
+breed [shoppers shopper]
 
 ;; =========================================================
 ;; MODEL DECLARATIONS
@@ -280,18 +282,22 @@ end
 
 to setup
   clear-all
+  no-display
 
   ;; Перевірка контракту вхідної конфігурації виконується до створення
   ;; агентів. Некоректний сценарій завершується з пояснювальною помилкою.
   validate-configuration
 
   initialize-system-state
-  setup-shoppers
+
+  ;; NW одночасно створює агентів і зв'язки потрібної топології.
+  ;; Це усуває окремий повільний етап ручного створення links.
   setup-social-network
 
   reset-ticks
   update-simulation-state
   update-visualization
+  display
 end
 
 
@@ -358,13 +364,6 @@ to initialize-system-state
   set final-withdrawal-ticks-completed 0
 end
 
-
-to setup-shoppers
-  create-shoppers number-of-shoppers [
-    initialize-shopper-state
-    assign-treatment-group
-  ]
-end
 
 
 to initialize-shopper-state
@@ -449,157 +448,69 @@ end
 ;; =========================================================
 ;; NETWORK MODULE
 ;; =========================================================
-;; Соціальна мережа є статичною в межах одного запуску. Порівняння
-;; топологій виконується за однакового цільового середнього ступеня.
+;; Соціальна мережа є статичною в межах одного запуску.
+;; Її топологію створюють стандартні генератори розширення NW.
+;; Це скорочує код, гарантує відповідність відомим алгоритмам
+;; і пришвидшує setup порівняно з поетапним створенням links.
 
 to setup-social-network
-  ask links [ die ]
-
-  ;; Захист від некоректного значення після відкриття старішої версії моделі.
+  ;; Захист від некоректного значення після відкриття старішої версії.
   if not member? network-topology
     ["small-world" "ring-lattice" "random" "preferential-attachment"] [
     set network-topology "small-world"
   ]
 
+  ;; Для Watts–Strogatz neighborhood-size означає кількість сусідів
+  ;; з кожного боку кільця. Очікуваний degree дорівнює 2k.
+  let neighborhood-size max list 1 floor (network-degree / 2)
+
   if network-topology = "ring-lattice" [
-    setup-ring-lattice
+    ;; Регулярна кільцева ґратка: Watts–Strogatz без перепідключення.
+    nw:generate-watts-strogatz
+      shoppers links number-of-shoppers neighborhood-size 0
+      [ initialize-generated-shopper ]
   ]
 
   if network-topology = "small-world" [
-    setup-ring-lattice
-    rewire-ring-lattice
+    ;; Класична small-world топологія Watts–Strogatz.
+    nw:generate-watts-strogatz
+      shoppers links number-of-shoppers neighborhood-size rewiring-probability
+      [ initialize-generated-shopper ]
   ]
 
   if network-topology = "random" [
-    setup-random-network
+    ;; Erdős–Rényi G(n,p). p підібрано так, щоб очікуваний
+    ;; середній degree приблизно дорівнював network-degree.
+    let connection-probability
+      min list 1 (network-degree / (number-of-shoppers - 1))
+
+    nw:generate-random
+      shoppers links number-of-shoppers connection-probability
+      [ initialize-generated-shopper ]
   ]
 
   if network-topology = "preferential-attachment" [
-    setup-preferential-attachment-network
+    ;; Barabási–Albert. Середній degree приблизно дорівнює 2m.
+    let minimum-degree max list 1 floor (network-degree / 2)
+
+    nw:generate-preferential-attachment
+      shoppers links number-of-shoppers minimum-degree
+      [ initialize-generated-shopper ]
   ]
 
-  ;; Розміщення не впливає на взаємодії: WOM передається через links.
+  ;; Явний контекст потрібен для подальших NW-метрик та аналізу.
+  nw:set-context shoppers links
+
+  ;; Розміщення впливає лише на вигляд, а не на WOM.
   layout-circle shoppers (max-pxcor - 1)
   ask links [ set hidden? not show-network? ]
 end
 
 
-;; Регулярне кільце: кожен агент з'єднаний приблизно з network-degree
-;; найближчими сусідами. Для симетрії використовується парне число.
-to setup-ring-lattice
-  let half-degree floor (network-degree / 2)
-  ask shoppers [
-    let source self
-    foreach (range 1 (half-degree + 1)) [ offset ->
-      let target shopper (([who] of source + offset) mod count shoppers)
-      if target != nobody and not link-neighbor? target [
-        create-link-with target
-      ]
-    ]
-  ]
-end
-
-
-;; Watts–Strogatz-подібне перепідключення. Кожне ребро з певною
-;; імовірністю переносить один кінець до випадкового нового агента.
-to rewire-ring-lattice
-  ask links [
-    if random-float 1 < rewiring-probability [
-      let source end1
-      let old-target end2
-      let source-neighbors [link-neighbors] of source
-      let candidates shoppers with [
-        self != source and not member? self source-neighbors
-      ]
-      if any? candidates [
-        let new-target one-of candidates
-        ask source [ create-link-with new-target ]
-        die
-      ]
-    ]
-  ]
-end
-
-
-;; Випадкова мережа з приблизно тією самою очікуваною кількістю ребер,
-;; що й ring-lattice. Дублікати та петлі не створюються.
-to setup-random-network
-  ;; Максимальна кількість неорієнтованих зв’язків без петель.
-  let shopper-count count shoppers
-  let maximum-link-count (shopper-count * (shopper-count - 1)) / 2
-
-  ;; Бажану кількість зв’язків обмежуємо теоретичним максимумом,
-  ;; щоб цикл гарантовано завершувався навіть за завеликого network-degree.
-  let target-link-count min list
-    floor (shopper-count * network-degree / 2)
-    maximum-link-count
-
-  while [count links < target-link-count] [
-    let source one-of shoppers
-
-    ;; Важливо явно виключити source. Вираз other shoppers тут не підходить,
-    ;; оскільки процедура виконується в контексті observer, а не turtle.
-    let candidates shoppers with [
-      self != source and not link-neighbor? source
-    ]
-
-    if any? candidates [
-      let target one-of candidates
-      ask source [
-        create-link-with target
-      ]
-    ]
-  ]
-end
-
-
-;; Мережа переважного приєднання. Нові вузли частіше з'єднуються з
-;; агентами, які вже мають більше контактів, утворюючи соціальні хаби.
-to setup-preferential-attachment-network
-  let ordered sort shoppers
-  let attachment-count max list 1 floor (network-degree / 2)
-  let seed-size max list 3 (min list (attachment-count + 1) count shoppers)
-  let seed sublist ordered 0 seed-size
-
-  ;; Початкове ядро робимо зв'язним.
-  foreach seed [ a ->
-    foreach seed [ b ->
-      if [who] of a < [who] of b [
-        ask a [ create-link-with b ]
-      ]
-    ]
-  ]
-
-  let newcomers sublist ordered seed-size (length ordered)
-  foreach newcomers [ newcomer ->
-    let links-to-create min list attachment-count count shoppers with [self != newcomer]
-    repeat links-to-create [
-      let candidates shoppers with [
-        self != newcomer and not link-neighbor? newcomer
-      ]
-      if any? candidates [
-        let target weighted-degree-choice candidates
-        ask newcomer [ create-link-with target ]
-      ]
-    ]
-  ]
-end
-
-
-;; Вибір вузла пропорційно degree + 1, щоб навіть ізольований агент
-;; мав ненульову ймовірність отримати зв'язок.
-to-report weighted-degree-choice [candidate-set]
-  let candidates sort candidate-set
-  let total-weight sum [count link-neighbors + 1] of candidate-set
-  let draw random-float total-weight
-  let cumulative 0
-
-  foreach candidates [ candidate ->
-    set cumulative cumulative + [count link-neighbors + 1] of candidate
-    if draw <= cumulative [ report candidate ]
-  ]
-
-  report last candidates
+;; NW виконує цей блок для кожного щойно створеного агента.
+to initialize-generated-shopper
+  initialize-shopper-state
+  assign-treatment-group
 end
 
 
@@ -1473,8 +1384,8 @@ end
     <note x="35" y="265" backgroundDark="0" fontSize="12" width="240" markdown="false" height="25" textColorDark="-1" textColorLight="-16777216" backgroundLight="0">Social network and WOM</note>
     <switch x="180" y="300" height="35" on="false" variable="show-network?" display="show-network?" width="150" sizeVersion="0"></switch>
     <note x="30" y="80" backgroundDark="0" fontSize="12" width="150" markdown="false" height="25" textColorDark="-1" textColorLight="-16777216" backgroundLight="0">Loyalty program</note>
-    <slider x="240" step="2" y="345" max="20" display="network-degree" height="33" min="2" direction="Horizontal" default="16.0" variable="network-degree" width="180" sizeVersion="0"></slider>
-    <slider x="240" step="0.05" y="385" max="1" display="rewiring-probability" height="33" min="0" direction="Horizontal" default="0.75" variable="rewiring-probability" width="180" sizeVersion="0"></slider>
+    <slider x="240" step="2" y="345" max="20" display="network-degree" height="33" min="2" direction="Horizontal" default="6.0" variable="network-degree" width="180" sizeVersion="0"></slider>
+    <slider x="240" step="0.05" y="385" max="1" display="rewiring-probability" height="33" min="0" direction="Horizontal" default="0.15" variable="rewiring-probability" width="180" sizeVersion="0"></slider>
     <monitor x="25" precision="17" y="465" height="60" fontSize="11" width="205">current-phase</monitor>
     <monitor x="240" precision="0" y="465" height="60" fontSize="11" width="200" display="current-cycle">current-cycle</monitor>
     <monitor x="25" precision="3" y="530" height="60" fontSize="11" width="205">high-reward-crowding-out-effect</monitor>
@@ -1529,11 +1440,13 @@ end
 Випадаючий список `network-topology` задає тип соціальної мережі:
 
 - `small-world` — регулярне кільце з випадковим перепідключенням;
-- `ring-lattice` — локальна регулярна мережа;
-- `random` — випадкова мережа з приблизно заданою кількістю ребер;
-- `preferential-attachment` — мережа з хабами, утвореними переважним приєднанням.
+- `ring-lattice` — регулярна кільцева ґратка, створена `nw:generate-watts-strogatz` з нульовою ймовірністю перепідключення;
+- `random` — випадкова мережа Erdős–Rényi `G(n,p)`, створена `nw:generate-random`;
+- `preferential-attachment` — мережа Barabási–Albert з хабами, створена `nw:generate-preferential-attachment`.
 
-`network-degree` задає цільову кількість контактів, `rewiring-probability` використовується для small-world, `wom-on?` вмикає або вимикає соціальний канал, а `show-network?` керує лише візуалізацією links.
+Усі топології генерує стандартне розширення NetLogo `nw`. Для `small-world` і `ring-lattice` фактичний середній degree приблизно дорівнює `2 × floor(network-degree / 2)`. Для `random` імовірність ребра обчислюється як `network-degree / (number-of-shoppers - 1)`, а для `preferential-attachment` мінімальна кількість нових зв’язків дорівнює `floor(network-degree / 2)`.
+
+`rewiring-probability` використовується лише для `small-world`, `wom-on?` вмикає або вимикає соціальний канал, а `show-network?` керує лише візуалізацією links.
 
 ## Послідовність одного tick
 

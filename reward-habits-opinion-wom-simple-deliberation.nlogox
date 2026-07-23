@@ -1,6 +1,8 @@
 <?xml version="1.0" encoding="utf-8"?>
 <model version="NetLogo 7.0.4" snapToGrid="true">
-  <code><![CDATA[breed [shoppers shopper]
+  <code><![CDATA[extensions [nw]
+
+breed [shoppers shopper]
 
 ;; =========================================================
 ;; MODEL DECLARATIONS
@@ -38,6 +40,13 @@ globals [
   reward-ticks-completed
   inter-cycle-withdrawal-ticks-completed
   final-withdrawal-ticks-completed
+
+  ;; Constants
+  baseline-duration
+  habit-memory-window
+  salience-threshold
+  target-choice-cost
+  opinion-choice-weight
 ]
 
 
@@ -92,6 +101,10 @@ shoppers-own [
   received-wom
   received-wom-count
   spoke-wom?
+
+  ;; Фактична зміна opinion, спричинена WOM на поточному tick.
+  ;; Використовується лише для діагностики соціального механізму.
+  wom-opinion-change
 
   ;; Кількість цільових виборів у кожному типі фази.
   ;; Reward агрегується за всі активні кампанії, а withdrawal окремо
@@ -159,139 +172,44 @@ shoppers-own [
 ;; Іменовані reporters нижче є незмінними припущеннями конкретної
 ;; реалізації моделі. Вони не є динамічним станом і не задаються в UI.
 
-to-report baseline-duration
-  report 30
-end
-
-to-report initial-intrinsic-mean
-  report 0.50
-end
-
-to-report initial-intrinsic-sd
-  report 0.15
-end
-
-to-report initial-habit-mean
-  report 0.20
-end
-
-to-report initial-habit-sd
-  report 0.10
-end
-
 ;; Кількість останніх можливостей вибору, що визначають поточну звичку.
 ;; Це інтерпретований горизонт поведінкової пам'яті, а не швидкість навчання.
-to-report habit-memory-window
-  report 20
-end
-
 ;; Параметри розподілів індивідуальних властивостей shopper.
 ;; Середні значення habit/reward sensitivity зберігають масштаб впливів
 ;; попередньої версії моделі, але тепер агенти є неоднорідними.
-to-report price-sensitivity-mean
-  report 1
-end
-
-to-report habit-sensitivity-mean
-  report 1.5
-end
-
-to-report reward-sensitivity-mean
-  report 2
-end
-
-to-report behavioral-sensitivity-sd
-  report 0.25
-end
-
-to-report autonomy-sensitivity-mean
-  report 0.5
-end
-
-to-report autonomy-sensitivity-sd
-  report 0.2
-end
-
-;; Бар'єр цільового вибору: може означати вищу ціну, меншу зручність,
-;; додаткові витрати часу або інше зусилля.
-to-report target-choice-cost
-  report 1.5
-end
-
-;; Межа між підтримувальною та контролюючою винагородою.
-to-report salience-threshold
-  report 0.60
-end
-
-
-;; Середні параметри нових індивідуальних характеристик.
-to-report opinion-update-rate-mean
-  report 0.25
-end
-
-to-report opinion-update-rate-sd
-  report 0.10
-end
-
-to-report social-susceptibility-mean
-  report 0.35
-end
-
-to-report social-susceptibility-sd
-  report 0.15
-end
-
-to-report talk-propensity-mean
-  report 0.50
-end
-
-to-report talk-propensity-sd
-  report 0.15
-end
-
-;; Параметри формування satisfaction від окремої покупки.
-to-report target-experience-base
-  report 0.25
-end
-
-to-report alternative-experience-base
-  report -0.05
-end
-
-to-report reward-satisfaction-weight
-  report 0.45
-end
-
-to-report satisfaction-noise-sd
-  report 0.15
-end
-
-;; Opinion входить у utility як накопичена ставленнєва оцінка.
-;; Параметр відокремлено від social-susceptibility: остання визначає
-;; лише те, наскільки повідомлення інших змінюють opinion.
-to-report opinion-choice-weight
-  report 0.75
-end
-
 
 ;; =========================================================
 ;; SETUP
 ;; =========================================================
 
+to initialize-constants
+  set baseline-duration 30
+  set habit-memory-window 20
+  set salience-threshold 0.60
+  set target-choice-cost 1.50
+  set opinion-choice-weight 1.25
+end
+
+
 to setup
   clear-all
+  initialize-constants
+  no-display
 
   ;; Перевірка контракту вхідної конфігурації виконується до створення
   ;; агентів. Некоректний сценарій завершується з пояснювальною помилкою.
   validate-configuration
 
   initialize-system-state
-  setup-shoppers
+
+  ;; NW одночасно створює агентів і зв'язки потрібної топології.
+  ;; Це усуває окремий повільний етап ручного створення links.
   setup-social-network
 
   reset-ticks
   update-simulation-state
   update-visualization
+  display
 end
 
 
@@ -348,8 +266,15 @@ to validate-configuration
     error "rewiring-probability must be in the range [0, 1]"
   ]
 
-end
+  if not member? purchase-deliberation-mode ["low-involvement" "high-involvement"] [
+    error "purchase-deliberation-mode must be low-involvement or high-involvement"
+  ]
 
+  if confidence-bound <= 0 or confidence-bound > 2 [
+    error "confidence-bound must be in the range (0, 2]"
+  ]
+
+end
 
 to initialize-system-state
   set baseline-ticks-completed 0
@@ -358,60 +283,36 @@ to initialize-system-state
   set final-withdrawal-ticks-completed 0
 end
 
-
-to setup-shoppers
-  create-shoppers number-of-shoppers [
-    initialize-shopper-state
-    assign-treatment-group
-  ]
-end
-
-
 to initialize-shopper-state
   set shape "person"
   set size 0.7
 
   ;; Обрізані нормальні розподіли створюють гетерогенну популяцію,
   ;; зберігаючи значення психологічних станів у діапазоні [0; 1].
-  set intrinsic-motivation bounded-random-normal
-    initial-intrinsic-mean initial-intrinsic-sd 0 1
+  set intrinsic-motivation bounded-random-normal 0.5 0.15 0 1
 
-  let initial-habit bounded-random-normal
-    initial-habit-mean initial-habit-sd 0 1
+  let initial-habit bounded-random-normal 0.2 0.1 0 1
 
   ;; Поведінкові характеристики генеруються з обрізаних нормальних
   ;; розподілів. Це уникає надмірної кількості крайніх типів агентів.
-  set price-sensitivity bounded-random-normal
-    price-sensitivity-mean behavioral-sensitivity-sd 0.5 1.5
-
-  set habit-sensitivity bounded-random-normal
-    habit-sensitivity-mean behavioral-sensitivity-sd 0.75 2.25
-
-  set reward-sensitivity bounded-random-normal
-    reward-sensitivity-mean behavioral-sensitivity-sd 1 3
-
-  set autonomy-sensitivity bounded-random-normal
-    autonomy-sensitivity-mean autonomy-sensitivity-sd 0 1
+  set price-sensitivity bounded-random-normal 1 0.25 0.5 1.5
+  set habit-sensitivity bounded-random-normal 1.5 0.25 0.75 2.25
+  set reward-sensitivity bounded-random-normal 2 0.25 1 3
+  set autonomy-sensitivity bounded-random-normal 0.5 0.2 0 1
 
   ;; Початковий satisfaction майже нейтральний, а opinion містить
   ;; невеликий випадковий розкид. Надалі satisfaction замінюється
   ;; після кожної покупки, тоді як opinion накопичує досвід.
   set satisfaction bounded-random-normal 0 0.10 -1 1
   set opinion bounded-random-normal 0 0.15 -1 1
-
-  set opinion-update-rate bounded-random-normal
-    opinion-update-rate-mean opinion-update-rate-sd 0.05 0.80
-
-  set social-susceptibility bounded-random-normal
-    social-susceptibility-mean social-susceptibility-sd 0 1
-
-  ;; set talk-propensity bounded-random-normal
-  ;;  talk-propensity-mean talk-propensity-sd 0 1
+  set opinion-update-rate bounded-random-normal 0.25 0.1 0.05 0.80
+  set social-susceptibility bounded-random-normal 0.35 0.15 0 1
   set talk-propensity bounded-random-normal 0.65 0.15 0 1
 
   set received-wom 0
   set received-wom-count 0
   set spoke-wom? false
+  set wom-opinion-change 0
 
   ;; Початкова історія узгоджується з початковою силою звички.
   set recent-choice-history n-values habit-memory-window [
@@ -449,157 +350,69 @@ end
 ;; =========================================================
 ;; NETWORK MODULE
 ;; =========================================================
-;; Соціальна мережа є статичною в межах одного запуску. Порівняння
-;; топологій виконується за однакового цільового середнього ступеня.
+;; Соціальна мережа є статичною в межах одного запуску.
+;; Її топологію створюють стандартні генератори розширення NW.
+;; Це скорочує код, гарантує відповідність відомим алгоритмам
+;; і пришвидшує setup порівняно з поетапним створенням links.
 
 to setup-social-network
-  ask links [ die ]
-
-  ;; Захист від некоректного значення після відкриття старішої версії моделі.
+  ;; Захист від некоректного значення після відкриття старішої версії.
   if not member? network-topology
     ["small-world" "ring-lattice" "random" "preferential-attachment"] [
     set network-topology "small-world"
   ]
 
+  ;; Для Watts–Strogatz neighborhood-size означає кількість сусідів
+  ;; з кожного боку кільця. Очікуваний degree дорівнює 2k.
+  let neighborhood-size max list 1 floor (network-degree / 2)
+
   if network-topology = "ring-lattice" [
-    setup-ring-lattice
+    ;; Регулярна кільцева ґратка: Watts–Strogatz без перепідключення.
+    nw:generate-watts-strogatz
+      shoppers links number-of-shoppers neighborhood-size 0
+      [ initialize-generated-shopper ]
   ]
 
   if network-topology = "small-world" [
-    setup-ring-lattice
-    rewire-ring-lattice
+    ;; Класична small-world топологія Watts–Strogatz.
+    nw:generate-watts-strogatz
+      shoppers links number-of-shoppers neighborhood-size rewiring-probability
+      [ initialize-generated-shopper ]
   ]
 
   if network-topology = "random" [
-    setup-random-network
+    ;; Erdős–Rényi G(n,p). p підібрано так, щоб очікуваний
+    ;; середній degree приблизно дорівнював network-degree.
+    let connection-probability
+      min list 1 (network-degree / (number-of-shoppers - 1))
+
+    nw:generate-random
+      shoppers links number-of-shoppers connection-probability
+      [ initialize-generated-shopper ]
   ]
 
   if network-topology = "preferential-attachment" [
-    setup-preferential-attachment-network
+    ;; Barabási–Albert. Середній degree приблизно дорівнює 2m.
+    let minimum-degree max list 1 floor (network-degree / 2)
+
+    nw:generate-preferential-attachment
+      shoppers links number-of-shoppers minimum-degree
+      [ initialize-generated-shopper ]
   ]
 
-  ;; Розміщення не впливає на взаємодії: WOM передається через links.
+  ;; Явний контекст потрібен для подальших NW-метрик та аналізу.
+  nw:set-context shoppers links
+
+  ;; Розміщення впливає лише на вигляд, а не на WOM.
   layout-circle shoppers (max-pxcor - 1)
   ask links [ set hidden? not show-network? ]
 end
 
 
-;; Регулярне кільце: кожен агент з'єднаний приблизно з network-degree
-;; найближчими сусідами. Для симетрії використовується парне число.
-to setup-ring-lattice
-  let half-degree floor (network-degree / 2)
-  ask shoppers [
-    let source self
-    foreach (range 1 (half-degree + 1)) [ offset ->
-      let target shopper (([who] of source + offset) mod count shoppers)
-      if target != nobody and not link-neighbor? target [
-        create-link-with target
-      ]
-    ]
-  ]
-end
-
-
-;; Watts–Strogatz-подібне перепідключення. Кожне ребро з певною
-;; імовірністю переносить один кінець до випадкового нового агента.
-to rewire-ring-lattice
-  ask links [
-    if random-float 1 < rewiring-probability [
-      let source end1
-      let old-target end2
-      let source-neighbors [link-neighbors] of source
-      let candidates shoppers with [
-        self != source and not member? self source-neighbors
-      ]
-      if any? candidates [
-        let new-target one-of candidates
-        ask source [ create-link-with new-target ]
-        die
-      ]
-    ]
-  ]
-end
-
-
-;; Випадкова мережа з приблизно тією самою очікуваною кількістю ребер,
-;; що й ring-lattice. Дублікати та петлі не створюються.
-to setup-random-network
-  ;; Максимальна кількість неорієнтованих зв’язків без петель.
-  let shopper-count count shoppers
-  let maximum-link-count (shopper-count * (shopper-count - 1)) / 2
-
-  ;; Бажану кількість зв’язків обмежуємо теоретичним максимумом,
-  ;; щоб цикл гарантовано завершувався навіть за завеликого network-degree.
-  let target-link-count min list
-    floor (shopper-count * network-degree / 2)
-    maximum-link-count
-
-  while [count links < target-link-count] [
-    let source one-of shoppers
-
-    ;; Важливо явно виключити source. Вираз other shoppers тут не підходить,
-    ;; оскільки процедура виконується в контексті observer, а не turtle.
-    let candidates shoppers with [
-      self != source and not link-neighbor? source
-    ]
-
-    if any? candidates [
-      let target one-of candidates
-      ask source [
-        create-link-with target
-      ]
-    ]
-  ]
-end
-
-
-;; Мережа переважного приєднання. Нові вузли частіше з'єднуються з
-;; агентами, які вже мають більше контактів, утворюючи соціальні хаби.
-to setup-preferential-attachment-network
-  let ordered sort shoppers
-  let attachment-count max list 1 floor (network-degree / 2)
-  let seed-size max list 3 (min list (attachment-count + 1) count shoppers)
-  let seed sublist ordered 0 seed-size
-
-  ;; Початкове ядро робимо зв'язним.
-  foreach seed [ a ->
-    foreach seed [ b ->
-      if [who] of a < [who] of b [
-        ask a [ create-link-with b ]
-      ]
-    ]
-  ]
-
-  let newcomers sublist ordered seed-size (length ordered)
-  foreach newcomers [ newcomer ->
-    let links-to-create min list attachment-count count shoppers with [self != newcomer]
-    repeat links-to-create [
-      let candidates shoppers with [
-        self != newcomer and not link-neighbor? newcomer
-      ]
-      if any? candidates [
-        let target weighted-degree-choice candidates
-        ask newcomer [ create-link-with target ]
-      ]
-    ]
-  ]
-end
-
-
-;; Вибір вузла пропорційно degree + 1, щоб навіть ізольований агент
-;; мав ненульову ймовірність отримати зв'язок.
-to-report weighted-degree-choice [candidate-set]
-  let candidates sort candidate-set
-  let total-weight sum [count link-neighbors + 1] of candidate-set
-  let draw random-float total-weight
-  let cumulative 0
-
-  foreach candidates [ candidate ->
-    set cumulative cumulative + [count link-neighbors + 1] of candidate
-    if draw <= cumulative [ report candidate ]
-  ]
-
-  report last candidates
+;; NW виконує цей блок для кожного щойно створеного агента.
+to initialize-generated-shopper
+  initialize-shopper-state
+  assign-treatment-group
 end
 
 
@@ -874,19 +687,19 @@ end
 ;; Satisfaction — оцінка саме поточної покупки. Випадковий шум
 ;; відображає варіативність обслуговування та суб'єктивного сприйняття.
 to update-satisfaction
-  let expected-experience alternative-experience-base
+  let expected-experience -0.05
 
   if chose-target? [
-    set expected-experience target-experience-base
+    set expected-experience 0.25
 
     ;; Бонус підвищує задоволеність лише тоді, коли він реально активний
     ;; для treatment-групи й агент здійснив цільовий вибір.
     set expected-experience expected-experience
-      + reward-satisfaction-weight * active-reward-salience
+      + 0.45 * active-reward-salience
   ]
 
   set satisfaction clamp
-    (random-normal expected-experience satisfaction-noise-sd)
+    (random-normal expected-experience 0.15)
     -1 1
 end
 
@@ -903,39 +716,128 @@ end
 ;; WOM є подією комунікації, а не постійним станом агента.
 ;; 1) скидаємо тимчасові буфери;
 ;; 2) визначаємо, хто говорить;
-;; 3) накопичуємо повідомлення у сусідів;
-;; 4) один раз оновлюємо opinion кожного слухача.
+;; 3) відбираємо повідомлення в межах confidence-bound;
+;; 4) накопичуємо прийняті повідомлення;
+;; 5) один раз оновлюємо opinion кожного слухача.
 to perform-word-of-mouth-step
   ask shoppers [
     set received-wom 0
     set received-wom-count 0
     set spoke-wom? false
+    set wom-opinion-change 0
   ]
 
   if not wom-on? [ stop ]
 
+  if purchase-deliberation-mode = "low-involvement" [
+    perform-low-involvement-wom
+  ]
+
+  if purchase-deliberation-mode = "high-involvement" [
+    perform-high-involvement-wom
+  ]
+
+  apply-received-wom
+end
+
+
+;; LOW-INVOLVEMENT PURCHASE
+;; Спонтанна рекомендація: активний speaker повідомляє свою думку одному
+;; випадковому знайомому. Слухач використовує лише першу прийняту
+;; рекомендацію на цьому tick, що моделює просте рішення з низькою ціною
+;; помилки (наприклад, спробувати нову кав'ярню).
+to perform-low-involvement-wom
   ask shoppers [
-    let talk-probability talk-propensity * abs opinion
+    let talk-probability clamp (talk-propensity * abs opinion) 0 1
 
-    if random-float 1 < talk-probability [
+    if random-float 1 < talk-probability and any? link-neighbors [
       set spoke-wom? true
-      ;; let message opinion
-      ;; let 
-      let message satisfaction
 
-      ask link-neighbors [
-        set received-wom received-wom + message
-        set received-wom-count received-wom-count + 1
+      let listener one-of link-neighbors
+      let message outgoing-wom-message
+
+      ask listener [
+        if received-wom-count = 0 [
+          let discrepancy abs (message - opinion)
+
+          if discrepancy <= confidence-bound [
+            set received-wom message
+            set received-wom-count 1
+          ]
+        ]
       ]
     ]
   ]
+end
 
+
+;; HIGH-INVOLVEMENT PURCHASE
+;; Цілеспрямований пошук інформації: кожен покупець звертається до всіх
+;; своїх безпосередніх знайомих. Кожен знайомий ділиться думкою з
+;; імовірністю, що залежить від talk-propensity та сили opinion.
+;; Покупець агрегує всі повідомлення, що потрапили в confidence-bound.
+to perform-high-involvement-wom
+  ask shoppers with [any? link-neighbors] [
+    let listener self
+
+    ask link-neighbors [
+      let share-probability clamp (talk-propensity * abs opinion) 0 1
+
+      if random-float 1 < share-probability [
+        set spoke-wom? true
+        let message outgoing-wom-message
+
+        ask listener [
+          let discrepancy abs (message - opinion)
+
+          if discrepancy <= confidence-bound [
+            set received-wom received-wom + message
+            set received-wom-count received-wom-count + 1
+          ]
+        ]
+      ]
+    ]
+  ]
+end
+
+
+;; Оновлення виконується один раз після завершення всіх комунікацій.
+;; social-susceptibility визначає силу зміни після того, як повідомлення
+;; вже пройшли фільтр прийняття.
+to apply-received-wom
   ask shoppers with [received-wom-count > 0] [
+    let old-opinion opinion
     let social-signal received-wom / received-wom-count
+
     set opinion clamp
       (opinion + social-susceptibility * (social-signal - opinion))
       -1 1
+
+    set wom-opinion-change opinion - old-opinion
   ]
+end
+
+
+;; Повідомлення поєднує накопичене ставлення та останній досвід.
+;; Opinion робить сигнал стабільним, satisfaction дозволяє швидко
+;; поширювати реакцію на поточну покупку або активну винагороду.
+to-report outgoing-wom-message
+  report clamp (0.7 * opinion + 0.3 * satisfaction) -1 1
+end
+
+
+;; Частка агентів, які прийняли хоча б одне WOM-повідомлення.
+to-report wom-receiver-share
+  if not any? shoppers [ report 0 ]
+  report count shoppers with [received-wom-count > 0] / count shoppers
+end
+
+
+;; Середній абсолютний зсув opinion, без взаємного погашення позитивних
+;; і негативних змін.
+to-report mean-absolute-wom-opinion-change
+  if not any? shoppers [ report 0 ]
+  report mean [abs wom-opinion-change] of shoppers
 end
 
 
@@ -982,7 +884,7 @@ to record-system-state
     set inter-cycle-withdrawal-ticks-completed
       inter-cycle-withdrawal-ticks-completed + 1
   ]
-
+    
   if final-withdrawal? [
     set final-withdrawal-ticks-completed
       final-withdrawal-ticks-completed + 1
@@ -1303,8 +1205,7 @@ end
 ]]></code>
   <widgets>
     <view x="455" wrappingAllowedX="false" y="15" frameRate="30.0" minPycor="-16" height="515" showTickCounter="true" patchSize="15.5" fontSize="10" wrappingAllowedY="false" width="515" tickCounterLabel="ticks" maxPycor="16" updateMode="0" maxPxcor="16" minPxcor="-16"></view>
-    <button x="100" y="15" height="40" disableUntilTicks="false" forever="true" kind="Observer" width="55">go</button>
-    <slider x="30" step="1" y="115" max="6" display="reward-cycles" height="33" min="0" direction="Horizontal" default="3.0" variable="reward-cycles" width="125" sizeVersion="0"></slider>
+    <slider x="30" step="1" y="115" max="6" display="reward-cycles" height="33" min="0" direction="Horizontal" default="1.0" variable="reward-cycles" width="125" sizeVersion="0"></slider>
     <slider x="30" step="5" y="158" max="200" display="reward-duration" height="33" min="10" direction="Horizontal" default="60.0" variable="reward-duration" width="140" sizeVersion="0"></slider>
     <slider x="30" step="0.05" y="200" max="1" display="low-reward-salience" height="33" min="0" direction="Horizontal" default="0.15" variable="low-reward-salience" width="175" sizeVersion="0"></slider>
     <slider x="215" step="0.05" y="200" max="1" display="high-reward-salience" height="33" min="0" direction="Horizontal" default="0.9" variable="high-reward-salience" width="175" sizeVersion="0"></slider>
@@ -1473,37 +1374,45 @@ end
     <note x="35" y="265" backgroundDark="0" fontSize="12" width="240" markdown="false" height="25" textColorDark="-1" textColorLight="-16777216" backgroundLight="0">Social network and WOM</note>
     <switch x="180" y="300" height="35" on="false" variable="show-network?" display="show-network?" width="150" sizeVersion="0"></switch>
     <note x="30" y="80" backgroundDark="0" fontSize="12" width="150" markdown="false" height="25" textColorDark="-1" textColorLight="-16777216" backgroundLight="0">Loyalty program</note>
-    <slider x="240" step="2" y="345" max="20" display="network-degree" height="33" min="2" direction="Horizontal" default="16.0" variable="network-degree" width="180" sizeVersion="0"></slider>
-    <slider x="240" step="0.05" y="385" max="1" display="rewiring-probability" height="33" min="0" direction="Horizontal" default="0.75" variable="rewiring-probability" width="180" sizeVersion="0"></slider>
-    <monitor x="25" precision="17" y="465" height="60" fontSize="11" width="205">current-phase</monitor>
-    <monitor x="240" precision="0" y="465" height="60" fontSize="11" width="200" display="current-cycle">current-cycle</monitor>
-    <monitor x="25" precision="3" y="530" height="60" fontSize="11" width="205">high-reward-crowding-out-effect</monitor>
-    <monitor x="240" precision="3" y="530" height="60" fontSize="11" width="200">low-reward-persistence-effect</monitor>
-    <monitor x="25" precision="3" y="600" height="60" fontSize="11" width="205" display="WOM speaker share">wom-speaker-share</monitor>
-    <monitor x="240" precision="2" y="600" height="60" fontSize="11" width="195" display="Mean network degree">mean-network-degree</monitor>
-    <note x="605" y="540" backgroundDark="0" fontSize="12" width="220" markdown="false" height="30" textColorDark="-1" textColorLight="-16777216" backgroundLight="0">Persistence (final withdrawal)</note>
+    <slider x="240" step="0.05" y="385" max="1" display="rewiring-probability" height="33" min="0" direction="Horizontal" default="0.15" variable="rewiring-probability" width="180" sizeVersion="0"></slider>
     <note x="600" y="655" backgroundDark="0" fontSize="12" width="230" markdown="false" height="30" textColorDark="-1" textColorLight="-16777216" backgroundLight="0">Persistence Index (post − baseline)</note>
     <monitor x="510" precision="3" y="690" height="60" fontSize="11" display="Control" width="105" sizeVersion="0">persistence-index "control"</monitor>
     <monitor x="642" precision="3" y="690" height="60" fontSize="11" display="Low Salience" width="100" sizeVersion="0">persistence-index "low-salience"</monitor>
     <monitor x="770" precision="3" y="690" height="60" fontSize="11" display="High Salience" width="100" sizeVersion="0">persistence-index "high-salience"</monitor>
-    <slider x="170" step="20" y="20" max="3000" display="number-of-shoppers" height="33" min="20" direction="Horizontal" default="1000.0" variable="number-of-shoppers" width="260" sizeVersion="0"></slider>
     <chooser x="35" y="345" height="55" variable="network-topology" current="0" display="network-topology" width="190" sizeVersion="0">
       <choice type="string" value="small-world"></choice>
       <choice type="string" value="preferential-attachment"></choice>
       <choice type="string" value="ring-lattice"></choice>
       <choice type="string" value="random"></choice>
     </chooser>
-    <switch x="35" y="300" height="35" on="true" variable="wom-on?" display="wom-on?" width="130" sizeVersion="0"></switch>
     <slider x="215" step="5" y="158" max="200" display="withdrawal-duration" height="33" min="10" direction="Horizontal" default="60.0" variable="withdrawal-duration" width="175" sizeVersion="0"></slider>
     <monitor x="770" precision="3" y="575" height="60" fontSize="11" display="High Salience" width="100" sizeVersion="0">persistence "high-salience"</monitor>
     <monitor x="642" precision="3" y="575" height="60" fontSize="11" display="Low Salience" width="100" sizeVersion="0">persistence "low-salience"</monitor>
     <monitor x="510" precision="3" y="575" height="60" fontSize="11" display="Control" width="105" sizeVersion="0">persistence "control"</monitor>
-    <monitor x="25" precision="4" y="680" height="60" fontSize="11" width="100">mean [opinion] of shoppers</monitor>
-    <monitor x="135" precision="4" y="680" height="60" fontSize="11" width="100">standard-deviation [opinion] of shoppers</monitor>
-    <monitor x="250" precision="4" y="680" height="60" fontSize="11" width="100">wom-speaker-share</monitor>
-    <monitor x="25" precision="4" y="750" height="60" fontSize="11" width="100">mean [received-wom-count] of shoppers</monitor>
-    <monitor x="190" precision="4" y="750" height="60" fontSize="11" width="100"><![CDATA[mean [received-wom / received-wom-count] of shoppers with [received-wom-count > 0]]]></monitor>
     <button x="30" y="15" height="40" disableUntilTicks="false" forever="false" kind="Observer" width="55">setup</button>
+    <slider x="240" step="2" y="345" max="20" display="network-degree" height="33" min="2" direction="Horizontal" default="6.0" variable="network-degree" width="180" sizeVersion="0"></slider>
+    <note x="605" y="550" backgroundDark="0" fontSize="12" width="220" markdown="false" height="30" textColorDark="-1" textColorLight="-16777216" backgroundLight="0">Persistence (final withdrawal)</note>
+    <button x="90" y="15" height="40" disableUntilTicks="false" forever="true" kind="Observer" width="55">go</button>
+    <slider x="170" step="20" y="20" max="3000" display="number-of-shoppers" height="33" min="20" direction="Horizontal" default="1000.0" variable="number-of-shoppers" width="170" sizeVersion="0"></slider>
+    <switch x="35" y="300" height="35" on="true" variable="wom-on?" display="wom-on?" width="130" sizeVersion="0"></switch>
+    <monitor x="25" precision="4" y="890" height="60" fontSize="11" width="195" display="WOM receiver share">wom-receiver-share</monitor>
+    <monitor x="25" precision="17" y="520" height="60" fontSize="11" width="205">current-phase</monitor>
+    <monitor x="240" precision="2" y="655" height="60" fontSize="11" width="195" display="Mean network degree">mean-network-degree</monitor>
+    <monitor x="25" precision="3" y="655" height="60" fontSize="11" width="205" display="WOM speaker share">wom-speaker-share</monitor>
+    <monitor x="240" precision="3" y="585" height="60" fontSize="11" width="200">low-reward-persistence-effect</monitor>
+    <monitor x="25" precision="3" y="585" height="60" fontSize="11" width="205">high-reward-crowding-out-effect</monitor>
+    <monitor x="240" precision="0" y="520" height="60" fontSize="11" width="200" display="current-cycle">current-cycle</monitor>
+    <monitor x="25" precision="4" y="830" height="60" fontSize="11" width="170" display="Mean received-wom-count">mean [received-wom-count] of shoppers</monitor>
+    <monitor x="230" precision="4" y="830" height="60" fontSize="11" width="205" display="Mean average received WOM"><![CDATA[mean [received-wom / received-wom-count] of shoppers with [received-wom-count > 0]]]></monitor>
+    <monitor x="230" precision="4" y="890" height="60" fontSize="11" width="195" display="Mean |WOM opinion change|">mean-absolute-wom-opinion-change</monitor>
+    <monitor x="305" precision="4" y="745" height="60" fontSize="11" width="135">wom-speaker-share</monitor>
+    <monitor x="165" precision="4" y="745" height="60" fontSize="11" width="130" display="StdDev Opinion">standard-deviation [opinion] of shoppers</monitor>
+    <monitor x="25" precision="4" y="745" height="60" fontSize="11" width="130" display="Mean opinion">mean [opinion] of shoppers</monitor>
+    <slider x="240" step="0.05" y="450" max="2" display="confidence-bound" height="33" min="0.05" direction="Horizontal" default="0.75" variable="confidence-bound" width="175" sizeVersion="0"></slider>
+    <chooser x="30" y="440" height="55" variable="purchase-deliberation-mode" current="1" display="purchase-deliberation-mode" width="200" sizeVersion="0">
+      <choice type="string" value="low-involvement"></choice>
+      <choice type="string" value="high-involvement"></choice>
+    </chooser>
   </widgets>
   <info># Агентна модель програм лояльності, satisfaction, opinion і WOM
 
@@ -1529,11 +1438,13 @@ end
 Випадаючий список `network-topology` задає тип соціальної мережі:
 
 - `small-world` — регулярне кільце з випадковим перепідключенням;
-- `ring-lattice` — локальна регулярна мережа;
-- `random` — випадкова мережа з приблизно заданою кількістю ребер;
-- `preferential-attachment` — мережа з хабами, утвореними переважним приєднанням.
+- `ring-lattice` — регулярна кільцева ґратка, створена `nw:generate-watts-strogatz` з нульовою ймовірністю перепідключення;
+- `random` — випадкова мережа Erdős–Rényi `G(n,p)`, створена `nw:generate-random`;
+- `preferential-attachment` — мережа Barabási–Albert з хабами, створена `nw:generate-preferential-attachment`.
 
-`network-degree` задає цільову кількість контактів, `rewiring-probability` використовується для small-world, `wom-on?` вмикає або вимикає соціальний канал, а `show-network?` керує лише візуалізацією links.
+Усі топології генерує стандартне розширення NetLogo `nw`. Для `small-world` і `ring-lattice` фактичний середній degree приблизно дорівнює `2 × floor(network-degree / 2)`. Для `random` імовірність ребра обчислюється як `network-degree / (number-of-shoppers - 1)`, а для `preferential-attachment` мінімальна кількість нових зв’язків дорівнює `floor(network-degree / 2)`.
+
+`rewiring-probability` використовується лише для `small-world`, `wom-on?` вмикає або вимикає соціальний канал, а `show-network?` керує лише візуалізацією links.
 
 ## Послідовність одного tick
 
@@ -1672,6 +1583,16 @@ Crosses reward magnitude with campaign duration. It tests whether longer exposur
 Varies the number, duration, and withdrawal spacing of campaigns. It tests whether repeated shorter campaigns produce better persistence than a single or prolonged intervention.
 
 All experiments use 30 repetitions per configuration and record behavior, motivation, habit, persistence, withdrawal drop, and retention metrics.
+
+
+## Режими слухання WOM
+
+`purchase-deliberation-mode` задає механізм прийняття рекомендацій:
+
+- `low-involvement`: спонтанний speaker передає рекомендацію одному знайомому; слухач використовує перше прийняте повідомлення на tick. Режим відповідає недорогим і швидким рішенням.
+- `high-involvement`: покупець сам звертається до всіх безпосередніх знайомих у своїй мережі, збирає доступні рекомендації та агрегує прийняті думки. Режим відповідає дорогим покупкам із цілеспрямованим пошуком інформації.
+
+`confidence-bound` задає максимальну допустиму різницю між поточним opinion покупця та отриманою рекомендацією. Повідомлення поза цією межею ігноруються. `social-susceptibility` визначає силу зміни opinion уже після прийняття повідомлення.
 </info>
   <turtleShapes>
     <shape name="default" rotatable="true" editableColorIndex="0">
