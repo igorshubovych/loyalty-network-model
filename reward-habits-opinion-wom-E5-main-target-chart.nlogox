@@ -1206,78 +1206,12 @@ to-report behaviorsearch-fitness-no-crowding
 end
 ]]></code>
   <widgets>
-    <view x="455" wrappingAllowedX="false" y="15" frameRate="30.0" minPycor="-16" height="515" showTickCounter="true" patchSize="15.5" fontSize="10" wrappingAllowedY="false" width="515" tickCounterLabel="ticks" maxPycor="16" updateMode="0" maxPxcor="16" minPxcor="-16"></view>
+    <view x="455" wrappingAllowedX="false" y="15" frameRate="30.0" minPycor="-16" height="10" showTickCounter="false" patchSize="0.3" fontSize="10" wrappingAllowedY="false" width="10" tickCounterLabel="ticks" maxPycor="16" updateMode="0" maxPxcor="16" minPxcor="-16"></view>
     <slider x="30" step="1" y="115" max="6" display="reward-cycles" height="33" min="0" direction="Horizontal" default="1.0" variable="reward-cycles" width="125" sizeVersion="0"></slider>
     <slider x="30" step="5" y="158" max="200" display="reward-duration" height="33" min="10" direction="Horizontal" default="60.0" variable="reward-duration" width="140" sizeVersion="0"></slider>
     <slider x="30" step="0.05" y="200" max="1" display="low-reward-salience" height="33" min="0" direction="Horizontal" default="0.15" variable="low-reward-salience" width="175" sizeVersion="0"></slider>
     <slider x="215" step="0.05" y="200" max="1" display="high-reward-salience" height="33" min="0" direction="Horizontal" default="0.9" variable="high-reward-salience" width="175" sizeVersion="0"></slider>
-    <plot x="985" autoPlotX="true" yMax="0.5" autoPlotY="false" y="630" xMin="0.0" height="195" legend="true" xMax="160.0" yMin="-0.5" width="390" display="Intrinsic Motivation Gap vs Control">
-      <setup></setup>
-      <update></update>
-      <pen interval="1.0" mode="0" display="Low salience - control" color="-11221820" legend="true">
-        <setup></setup>
-        <update>plotxy ticks (
-  mean [intrinsic-motivation] of shoppers with [treatment-group = "low-salience"]
-  - mean [intrinsic-motivation] of shoppers with [treatment-group = "control"]
-)</update>
-      </pen>
-      <pen interval="1.0" mode="0" display="High salience - control" color="-2674135" legend="true">
-        <setup></setup>
-        <update>plotxy ticks (
-  mean [intrinsic-motivation] of shoppers with [treatment-group = "high-salience"]
-  - mean [intrinsic-motivation] of shoppers with [treatment-group = "control"]
-)</update>
-      </pen>
-      <pen interval="1.0" mode="0" display="Zero reference" color="-7500403" legend="false">
-        <setup></setup>
-        <update>plotxy ticks 0</update>
-      </pen>
-    </plot>
-    <plot x="985" autoPlotX="true" yMax="1.0" autoPlotY="false" y="430" xMin="0.0" height="195" legend="true" xMax="160.0" yMin="0.0" width="390" display="Mean Habit Strength">
-      <setup></setup>
-      <update></update>
-      <pen interval="1.0" mode="0" display="Control" color="-15575016" legend="true">
-        <setup></setup>
-        <update>plotxy ticks mean [habit] of shoppers with [
-    treatment-group = "control"
-]</update>
-      </pen>
-      <pen interval="1.0" mode="0" display="Low salience" color="-11221820" legend="true">
-        <setup></setup>
-        <update>plotxy ticks mean [habit] of shoppers with [
-    treatment-group = "low-salience"
-]</update>
-      </pen>
-      <pen interval="1.0" mode="0" display="High salience" color="-2674135" legend="true">
-        <setup></setup>
-        <update>plotxy ticks mean [habit] of shoppers with [
-    treatment-group = "high-salience"
-]</update>
-      </pen>
-    </plot>
-    <plot x="985" autoPlotX="true" yMax="1.0" autoPlotY="false" y="240" xMin="0.0" height="185" legend="true" xMax="160.0" yMin="0.0" width="390" display="Mean Intrinsic Motivation">
-      <setup></setup>
-      <update></update>
-      <pen interval="1.0" mode="0" display="Control" color="-15575016" legend="true">
-        <setup></setup>
-        <update>plotxy ticks mean [intrinsic-motivation] of shoppers with [
-    treatment-group = "control"
-]</update>
-      </pen>
-      <pen interval="1.0" mode="0" display="Low salience" color="-11221820" legend="true">
-        <setup></setup>
-        <update>plotxy ticks mean [intrinsic-motivation] of shoppers with [
-    treatment-group = "low-salience"
-]</update>
-      </pen>
-      <pen interval="1.0" mode="0" display="High salience" color="-2674135" legend="true">
-        <setup></setup>
-        <update>plotxy ticks mean [intrinsic-motivation] of shoppers with [
-    treatment-group = "high-salience"
-]</update>
-      </pen>
-    </plot>
-    <plot x="985" autoPlotX="true" yMax="1.0" autoPlotY="true" y="10" xMin="0.0" height="220" legend="true" xMax="0.0" yMin="0.0" width="390" display="Target choice rate">
+    <plot x="455" autoPlotX="true" yMax="1.0" autoPlotY="false" y="15" xMin="0.0" height="515" legend="true" xMax="0.0" yMin="0.0" width="515" display="Target choice rate">
       <setup></setup>
       <update></update>
       <pen interval="1.0" mode="0" display="Control" color="-15575016" legend="true">
@@ -1303,74 +1237,6 @@ end
 ] / count shoppers with [
   treatment-group = "high-salience"
 ]</update>
-      </pen>
-    </plot>
-    <plot x="1385" autoPlotX="true" yMax="1.0" autoPlotY="false" y="10" xMin="0.0" height="270" legend="true" xMax="160.0" yMin="0.0" width="390" display="Persistence after reward withdrawal">
-      <setup></setup>
-      <update></update>
-      <pen interval="1.0" mode="0" display="Control" color="-15575016" legend="true">
-        <setup></setup>
-        <update><![CDATA[if final-withdrawal-ticks-completed > 0 [ plotxy ticks persistence "control" ]]]></update>
-      </pen>
-      <pen interval="1.0" mode="0" display="Low salience" color="-11221820" legend="true">
-        <setup></setup>
-        <update><![CDATA[if final-withdrawal-ticks-completed > 0 [ plotxy ticks persistence "low-salience" ]]]></update>
-      </pen>
-      <pen interval="1.0" mode="0" display="High salience" color="-2674135" legend="true">
-        <setup></setup>
-        <update><![CDATA[if final-withdrawal-ticks-completed > 0 [ plotxy ticks persistence "high-salience" ]]]></update>
-      </pen>
-    </plot>
-    <plot x="1385" autoPlotX="true" yMax="0.5" autoPlotY="false" y="290" xMin="0.0" height="395" legend="true" xMax="160.0" yMin="-0.5" width="390" display="Persistence Index">
-      <setup></setup>
-      <update></update>
-      <pen interval="1.0" mode="0" display="Control" color="-15575016" legend="true">
-        <setup></setup>
-        <update><![CDATA[if final-withdrawal-ticks-completed > 0 [ plotxy ticks persistence-index "control" ]]]></update>
-      </pen>
-      <pen interval="1.0" mode="0" display="Low salience" color="-11221820" legend="true">
-        <setup></setup>
-        <update><![CDATA[if final-withdrawal-ticks-completed > 0 [ plotxy ticks persistence-index "low-salience" ]]]></update>
-      </pen>
-      <pen interval="1.0" mode="0" display="High salience" color="-2674135" legend="true">
-        <setup></setup>
-        <update><![CDATA[if final-withdrawal-ticks-completed > 0 [ plotxy ticks persistence-index "high-salience" ]]]></update>
-      </pen>
-      <pen interval="1.0" mode="0" display="Zero reference" color="-7500403" legend="false">
-        <setup></setup>
-        <update><![CDATA[if final-withdrawal-ticks-completed > 0 [ plotxy ticks 0 ]]]></update>
-      </pen>
-    </plot>
-    <plot x="1385" autoPlotX="true" yMax="1.0" autoPlotY="false" y="700" xMin="0.0" height="220" legend="true" xMax="160.0" yMin="-1.0" width="390" display="Mean Satisfaction">
-      <setup></setup>
-      <update></update>
-      <pen interval="1.0" mode="0" display="Control" color="-10899396" legend="true">
-        <setup></setup>
-        <update>plot mean-satisfaction "control"</update>
-      </pen>
-      <pen interval="1.0" mode="0" display="Low salience" color="-11221820" legend="true">
-        <setup></setup>
-        <update>plot mean-satisfaction "low-salience"</update>
-      </pen>
-      <pen interval="1.0" mode="0" display="High salience" color="-2674135" legend="true">
-        <setup></setup>
-        <update>plot mean-satisfaction "high-salience"</update>
-      </pen>
-    </plot>
-    <plot x="1385" autoPlotX="true" yMax="1.0" autoPlotY="false" y="930" xMin="0.0" height="220" legend="true" xMax="160.0" yMin="-1.0" width="390" display="Mean Opinion">
-      <setup></setup>
-      <update></update>
-      <pen interval="1.0" mode="0" display="Control" color="-10899396" legend="true">
-        <setup></setup>
-        <update>plot mean-opinion "control"</update>
-      </pen>
-      <pen interval="1.0" mode="0" display="Low salience" color="-11221820" legend="true">
-        <setup></setup>
-        <update>plot mean-opinion "low-salience"</update>
-      </pen>
-      <pen interval="1.0" mode="0" display="High salience" color="-2674135" legend="true">
-        <setup></setup>
-        <update>plot mean-opinion "high-salience"</update>
       </pen>
     </plot>
     <note x="35" y="265" backgroundDark="0" fontSize="12" width="240" markdown="false" height="25" textColorDark="-1" textColorLight="-16777216" backgroundLight="0">Social network and WOM</note>
@@ -1409,13 +1275,147 @@ end
     <monitor x="305" precision="4" y="745" height="60" fontSize="11" width="135">wom-speaker-share</monitor>
     <monitor x="165" precision="4" y="745" height="60" fontSize="11" width="130" display="StdDev Opinion">standard-deviation [opinion] of shoppers</monitor>
     <monitor x="25" precision="4" y="745" height="60" fontSize="11" width="130" display="Mean opinion">mean [opinion] of shoppers</monitor>
-    <slider x="240" step="0.05" y="475" max="2" display="confidence-bound" height="33" min="0.05" direction="Horizontal" default="0.75" variable="confidence-bound" width="175" sizeVersion="0"></slider>
+    <slider x="240" step="0.05" y="475" max="2" display="confidence-bound" height="33" min="0.05" direction="Horizontal" default="0.35" variable="confidence-bound" width="175" sizeVersion="0"></slider>
     <chooser x="30" y="455" height="55" variable="purchase-deliberation-mode" current="1" display="purchase-deliberation-mode" width="200" sizeVersion="0">
       <choice type="string" value="low-involvement"></choice>
       <choice type="string" value="high-involvement"></choice>
     </chooser>
-    <slider x="240" step="0.25" y="440" max="3" display="opinion-weight" height="33" min="0" direction="Horizontal" default="0.75" variable="opinion-weight" width="175" sizeVersion="0"></slider>
+    <slider x="240" step="0.25" y="440" max="5" display="opinion-weight" height="33" min="0" direction="Horizontal" default="0.75" variable="opinion-weight" width="175" sizeVersion="0"></slider>
     <slider x="240" step="0.05" y="380" max="1" display="rewiring-probability" height="33" min="0" direction="Horizontal" default="0.15" variable="rewiring-probability" width="180" sizeVersion="0"></slider>
+    <plot x="985" autoPlotX="true" yMax="1.0" autoPlotY="false" y="15" xMin="0.0" height="185" legend="true" xMax="160.0" yMin="0.0" display="Mean Intrinsic Motivation" width="390" sizeVersion="0">
+      <setup></setup>
+      <update></update>
+      <pen interval="1.0" mode="0" display="Control" color="-15575016" legend="true">
+        <setup></setup>
+        <update>plotxy ticks mean [intrinsic-motivation] of shoppers with [
+    treatment-group = "control"
+]</update>
+      </pen>
+      <pen interval="1.0" mode="0" display="Low salience" color="-11221820" legend="true">
+        <setup></setup>
+        <update>plotxy ticks mean [intrinsic-motivation] of shoppers with [
+    treatment-group = "low-salience"
+]</update>
+      </pen>
+      <pen interval="1.0" mode="0" display="High salience" color="-2674135" legend="true">
+        <setup></setup>
+        <update>plotxy ticks mean [intrinsic-motivation] of shoppers with [
+    treatment-group = "high-salience"
+]</update>
+      </pen>
+    </plot>
+    <plot x="985" autoPlotX="true" yMax="1.0" autoPlotY="false" y="205" xMin="0.0" height="195" legend="true" xMax="160.0" yMin="0.0" display="Mean Habit Strength" width="390" sizeVersion="0">
+      <setup></setup>
+      <update></update>
+      <pen interval="1.0" mode="0" display="Control" color="-15575016" legend="true">
+        <setup></setup>
+        <update>plotxy ticks mean [habit] of shoppers with [
+    treatment-group = "control"
+]</update>
+      </pen>
+      <pen interval="1.0" mode="0" display="Low salience" color="-11221820" legend="true">
+        <setup></setup>
+        <update>plotxy ticks mean [habit] of shoppers with [
+    treatment-group = "low-salience"
+]</update>
+      </pen>
+      <pen interval="1.0" mode="0" display="High salience" color="-2674135" legend="true">
+        <setup></setup>
+        <update>plotxy ticks mean [habit] of shoppers with [
+    treatment-group = "high-salience"
+]</update>
+      </pen>
+    </plot>
+    <plot x="985" autoPlotX="true" yMax="0.5" autoPlotY="false" y="405" xMin="0.0" height="195" legend="true" xMax="160.0" yMin="-0.5" display="Intrinsic Motivation Gap vs Control" width="390" sizeVersion="0">
+      <setup></setup>
+      <update></update>
+      <pen interval="1.0" mode="0" display="Low salience - control" color="-11221820" legend="true">
+        <setup></setup>
+        <update>plotxy ticks (
+  mean [intrinsic-motivation] of shoppers with [treatment-group = "low-salience"]
+  - mean [intrinsic-motivation] of shoppers with [treatment-group = "control"]
+)</update>
+      </pen>
+      <pen interval="1.0" mode="0" display="High salience - control" color="-2674135" legend="true">
+        <setup></setup>
+        <update>plotxy ticks (
+  mean [intrinsic-motivation] of shoppers with [treatment-group = "high-salience"]
+  - mean [intrinsic-motivation] of shoppers with [treatment-group = "control"]
+)</update>
+      </pen>
+      <pen interval="1.0" mode="0" display="Zero reference" color="-7500403" legend="false">
+        <setup></setup>
+        <update>plotxy ticks 0</update>
+      </pen>
+    </plot>
+    <plot x="1385" autoPlotX="true" yMax="1.0" autoPlotY="false" y="10" xMin="0.0" height="245" legend="true" xMax="160.0" yMin="0.0" display="Persistence after reward withdrawal" width="390" sizeVersion="0">
+      <setup></setup>
+      <update></update>
+      <pen interval="1.0" mode="0" display="Control" color="-15575016" legend="true">
+        <setup></setup>
+        <update><![CDATA[if final-withdrawal-ticks-completed > 0 [ plotxy ticks persistence "control" ]]]></update>
+      </pen>
+      <pen interval="1.0" mode="0" display="Low salience" color="-11221820" legend="true">
+        <setup></setup>
+        <update><![CDATA[if final-withdrawal-ticks-completed > 0 [ plotxy ticks persistence "low-salience" ]]]></update>
+      </pen>
+      <pen interval="1.0" mode="0" display="High salience" color="-2674135" legend="true">
+        <setup></setup>
+        <update><![CDATA[if final-withdrawal-ticks-completed > 0 [ plotxy ticks persistence "high-salience" ]]]></update>
+      </pen>
+    </plot>
+    <plot x="1380" autoPlotX="true" yMax="1.0" autoPlotY="false" y="605" xMin="0.0" height="220" legend="true" xMax="160.0" yMin="-1.0" display="Mean Opinion" width="390" sizeVersion="0">
+      <setup></setup>
+      <update></update>
+      <pen interval="1.0" mode="0" display="Control" color="-10899396" legend="true">
+        <setup></setup>
+        <update>plot mean-opinion "control"</update>
+      </pen>
+      <pen interval="1.0" mode="0" display="Low salience" color="-11221820" legend="true">
+        <setup></setup>
+        <update>plot mean-opinion "low-salience"</update>
+      </pen>
+      <pen interval="1.0" mode="0" display="High salience" color="-2674135" legend="true">
+        <setup></setup>
+        <update>plot mean-opinion "high-salience"</update>
+      </pen>
+    </plot>
+    <plot x="985" autoPlotX="true" yMax="1.0" autoPlotY="false" y="605" xMin="0.0" height="220" legend="true" xMax="160.0" yMin="-1.0" display="Mean Satisfaction" width="390" sizeVersion="0">
+      <setup></setup>
+      <update></update>
+      <pen interval="1.0" mode="0" display="Control" color="-10899396" legend="true">
+        <setup></setup>
+        <update>plot mean-satisfaction "control"</update>
+      </pen>
+      <pen interval="1.0" mode="0" display="Low salience" color="-11221820" legend="true">
+        <setup></setup>
+        <update>plot mean-satisfaction "low-salience"</update>
+      </pen>
+      <pen interval="1.0" mode="0" display="High salience" color="-2674135" legend="true">
+        <setup></setup>
+        <update>plot mean-satisfaction "high-salience"</update>
+      </pen>
+    </plot>
+    <plot x="1385" autoPlotX="true" yMax="0.5" autoPlotY="false" y="260" xMin="0.0" height="270" legend="true" xMax="160.0" yMin="-0.5" display="Persistence Index" width="390" sizeVersion="0">
+      <setup></setup>
+      <update></update>
+      <pen interval="1.0" mode="0" display="Control" color="-15575016" legend="true">
+        <setup></setup>
+        <update><![CDATA[if final-withdrawal-ticks-completed > 0 [ plotxy ticks persistence-index "control" ]]]></update>
+      </pen>
+      <pen interval="1.0" mode="0" display="Low salience" color="-11221820" legend="true">
+        <setup></setup>
+        <update><![CDATA[if final-withdrawal-ticks-completed > 0 [ plotxy ticks persistence-index "low-salience" ]]]></update>
+      </pen>
+      <pen interval="1.0" mode="0" display="High salience" color="-2674135" legend="true">
+        <setup></setup>
+        <update><![CDATA[if final-withdrawal-ticks-completed > 0 [ plotxy ticks persistence-index "high-salience" ]]]></update>
+      </pen>
+      <pen interval="1.0" mode="0" display="Zero reference" color="-7500403" legend="false">
+        <setup></setup>
+        <update><![CDATA[if final-withdrawal-ticks-completed > 0 [ plotxy ticks 0 ]]]></update>
+      </pen>
+    </plot>
   </widgets>
   <info># Агентна модель програм лояльності, satisfaction, opinion і WOM
 
@@ -2755,6 +2755,83 @@ setup</setup>
         </enumeratedValueSet>
         <enumeratedValueSet variable="show-network?">
           <value value="false"></value>
+        </enumeratedValueSet>
+      </constants>
+    </experiment>
+    <experiment name="E6 opinion-weight" repetitions="30" sequentialRunOrder="true" runMetricsEveryStep="false">
+      <setup>setup</setup>
+      <go>go</go>
+      <exitCondition>simulation-finished?</exitCondition>
+      <metrics>
+        <metric>choice-rate "high-salience" "baseline"</metric>
+        <metric>choice-rate "high-salience" "reward"</metric>
+        <metric>final-withdrawal-choice-rate "high-salience"</metric>
+        <metric>high-reward-withdrawal-drop</metric>
+        <metric>high-reward-retention-ratio</metric>
+        <metric>persistence-index "high-salience"</metric>
+        <metric>mean-intrinsic-motivation "high-salience"</metric>
+        <metric>mean-habit "high-salience"</metric>
+        <metric>mean-opinion "high-salience"</metric>
+        <metric>wom-speaker-share</metric>
+        <metric>wom-receiver-share</metric>
+        <metric>mean-absolute-wom-opinion-change</metric>
+        <metric>mean-network-degree</metric>
+      </metrics>
+      <constants>
+        <enumeratedValueSet variable="number-of-shoppers">
+          <value value="1000"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="reward-cycles">
+          <value value="1"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="reward-duration">
+          <value value="60"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="withdrawal-duration">
+          <value value="80"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="low-reward-salience">
+          <value value="0.15"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="high-reward-salience">
+          <value value="0.75"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="wom-on?">
+          <value value="true"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="network-topology">
+          <value value="&quot;preferential-attachment&quot;"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="network-degree">
+          <value value="6"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="rewiring-probability">
+          <value value="0.15"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="purchase-deliberation-mode">
+          <value value="&quot;low-involvement&quot;"></value>
+          <value value="&quot;high-involvement&quot;"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="confidence-bound">
+          <value value="0.25"></value>
+          <value value="0.5"></value>
+          <value value="0.75"></value>
+          <value value="0.9"></value>
+          <value value="1"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="show-network?">
+          <value value="false"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="opinion-weight">
+          <value value="0"></value>
+          <value value="0.5"></value>
+          <value value="1"></value>
+          <value value="1.5"></value>
+          <value value="2"></value>
+          <value value="2.5"></value>
+          <value value="3"></value>
+          <value value="4"></value>
+          <value value="5"></value>
         </enumeratedValueSet>
       </constants>
     </experiment>

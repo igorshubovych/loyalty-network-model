@@ -14,7 +14,7 @@ breed [shoppers shopper]
 ;; 3) Shopper Decision Module — обчислює імовірність вибору;
 ;; 4) Behavioral State Module — оновлює звичку та мотивацію;
 ;; 5) Experience and Opinion Module — формує satisfaction та opinion;
-;; 6) Network and WOM Module — створює мережу та передає думки;
+;; 6) Network and Opinion Dynamics Module — створює мережу та виконує probabilistic bounded-confidence update;
 ;; 7) Metrics Module — накопичує й повертає результати;
 ;; 8) Visualization Module — відображає стан агентів.
 ;;
@@ -88,21 +88,19 @@ shoppers-own [
   ;; Воно формується власним досвідом і повідомленнями сусідів.
   opinion
 
-  ;; Сталі індивідуальні характеристики соціальної поведінки [0; 1].
-  ;; opinion-update-rate — чутливість до нового власного досвіду;
-  ;; social-susceptibility — схильність довіряти рекомендаціям;
-  ;; talk-propensity — базова готовність ділитися думкою.
+  ;; Чутливість opinion до нового власного досвіду.
   opinion-update-rate
-  social-susceptibility
-  talk-propensity
 
-  ;; Тимчасові змінні WOM. Вони скидаються на початку кожного tick.
-  received-wom
+  ;; Стан для синхронного probabilistic bounded-confidence update.
+  ;; previous-opinion фіксує стан на початку соціального кроку;
+  ;; next-opinion обчислюється без використання частково оновлених думок.
+  previous-opinion
+  next-opinion
+
+  ;; Кількість думок сусідів, прийнятих агентом на поточному tick.
   received-wom-count
-  spoke-wom?
 
-  ;; Фактична зміна opinion, спричинена WOM на поточному tick.
-  ;; Використовується лише для діагностики соціального механізму.
+  ;; Фактична зміна opinion, спричинена мережевим оновленням.
   wom-opinion-change
 
   ;; Кількість цільових виборів у кожному типі фази.
@@ -268,12 +266,20 @@ to validate-configuration
     error "rewiring-probability must be in the range [0, 1]"
   ]
 
-  if not member? purchase-deliberation-mode ["low-involvement" "high-involvement"] [
-    error "purchase-deliberation-mode must be low-involvement or high-involvement"
-  ]
-
   if confidence-bound <= 0 or confidence-bound > 2 [
     error "confidence-bound must be in the range (0, 2]"
+  ]
+
+  if acceptance-facilitation < 0 or acceptance-facilitation > 1 [
+    error "acceptance-facilitation must be in the range [0, 1]"
+  ]
+
+  if baseline-acceptance < 0 or baseline-acceptance > 1 [
+    error "baseline-acceptance must be in the range [0, 1]"
+  ]
+
+  if opinion-mutation-rate < 0 or opinion-mutation-rate > 1 [
+    error "opinion-mutation-rate must be in the range [0, 1]"
   ]
 
 end
@@ -308,12 +314,10 @@ to initialize-shopper-state
   set satisfaction bounded-random-normal 0 0.10 -1 1
   set opinion bounded-random-normal 0 0.15 -1 1
   set opinion-update-rate bounded-random-normal 0.25 0.1 0.05 0.80
-  set social-susceptibility bounded-random-normal 0.35 0.15 0 1
-  set talk-propensity bounded-random-normal 0.65 0.15 0 1
 
-  set received-wom 0
+  set previous-opinion opinion
+  set next-opinion opinion
   set received-wom-count 0
-  set spoke-wom? false
   set wom-opinion-change 0
 
   ;; Початкова історія узгоджується з початковою силою звички.
@@ -407,7 +411,6 @@ to setup-social-network
 
   ;; Розміщення впливає лише на вигляд, а не на WOM.
   layout-circle shoppers (max-pxcor - 1)
-  ask links [ set hidden? not show-network? ]
 end
 
 
@@ -436,7 +439,7 @@ to go
     perform-shopper-step
   ]
 
-  perform-word-of-mouth-step
+  perform-social-opinion-dynamics-step
 
   record-system-state
   update-visualization
@@ -540,7 +543,13 @@ to perform-shopper-step
   record-shopper-result
   update-behavioral-state
   update-satisfaction
-  update-opinion-from-experience
+
+  ;; У сценарії WOM OFF opinion не є частиною моделі прийняття рішення.
+  ;; У сценарії WOM ON власний досвід спочатку формує індивідуальну
+  ;; opinion, після чого вона проходить мережеве соціальне узгодження.
+  if wom-on? [
+    update-opinion-from-experience
+  ]
 end
 
 
@@ -586,8 +595,13 @@ end
 
 
 to-report opinion-contribution
-  ;; Opinion є довгостроковою ставленнєвою оцінкою. WOM впливає на
-  ;; вибір опосередковано: спершу змінює opinion, а вже opinion — utility.
+  ;; WOM OFF:
+  ;; price, intrinsic motivation, habit and reward determine target choice.
+  ;;
+  ;; WOM ON:
+  ;; satisfaction forms opinion; network bounded-confidence dynamics
+  ;; socially coordinates it; opinion then enters target-choice utility.
+  if not wom-on? [ report 0 ]
   report opinion-weight * opinion
 end
 
@@ -715,127 +729,107 @@ to update-opinion-from-experience
 end
 
 
-;; WOM є подією комунікації, а не постійним станом агента.
-;; 1) скидаємо тимчасові буфери;
-;; 2) визначаємо, хто говорить;
-;; 3) відбираємо повідомлення в межах confidence-bound;
-;; 4) накопичуємо прийняті повідомлення;
-;; 5) один раз оновлюємо opinion кожного слухача.
-to perform-word-of-mouth-step
+;; Мережеве соціальне узгодження opinion адаптує probabilistic
+;; bounded-confidence dynamics із codbc_m_eps_f_beta до статичної
+;; соціальної мережі.
+;;
+;; Повна логіка сценарію WOM ON:
+;; satisfaction -> individual opinion update -> network HK-like update
+;; -> opinion -> next target choice.
+;;
+;; Після оновлення opinion власним досвідом:
+;; 1) opinions фіксуються в previous-opinion;
+;; 2) кожен агент оцінює всіх безпосередніх link-neighbors;
+;; 3) кожна сусідська думка приймається з імовірністю, яка залежить
+;;    від розбіжності, confidence-bound, acceptance-facilitation
+;;    та baseline-acceptance;
+;; 4) next-opinion дорівнює середньому власної та прийнятих думок;
+;; 5) нові opinions застосовуються синхронно.
+to perform-social-opinion-dynamics-step
   ask shoppers [
-    set received-wom 0
+    set previous-opinion opinion
+    set next-opinion opinion
     set received-wom-count 0
-    set spoke-wom? false
     set wom-opinion-change 0
   ]
 
   if not wom-on? [ stop ]
 
-  if purchase-deliberation-mode = "low-involvement" [
-    perform-low-involvement-wom
-  ]
-
-  if purchase-deliberation-mode = "high-involvement" [
-    perform-high-involvement-wom
-  ]
-
-  apply-received-wom
-end
-
-
-;; LOW-INVOLVEMENT PURCHASE
-;; Спонтанна рекомендація: активний speaker повідомляє свою думку одному
-;; випадковому знайомому. Слухач використовує лише першу прийняту
-;; рекомендацію на цьому tick, що моделює просте рішення з низькою ціною
-;; помилки (наприклад, спробувати нову кав'ярню).
-to perform-low-involvement-wom
   ask shoppers [
-    let talk-probability clamp (talk-propensity * abs opinion) 0 1
+    ifelse random-float 1 < opinion-mutation-rate [
+      ;; Зовнішній інформаційний шок, аналог mutation у референтній моделі.
+      set next-opinion random-float 2 - 1
+    ]
+    [
+      let focal-agent self
+      let focal-opinion previous-opinion
 
-    if random-float 1 < talk-probability and any? link-neighbors [
-      set spoke-wom? true
-
-      let listener one-of link-neighbors
-      let message outgoing-wom-message
-
-      ask listener [
-        if received-wom-count = 0 [
-          let discrepancy abs (message - opinion)
-
-          if discrepancy <= confidence-bound [
-            set received-wom message
-            set received-wom-count 1
-          ]
-        ]
+      let accepted-neighbors link-neighbors with [
+        random-float 1 <
+          probability-acceptance
+            (abs (previous-opinion - [previous-opinion] of focal-agent))
       ]
+
+      set received-wom-count count accepted-neighbors
+
+      ;; Власна думка завжди входить до множини усереднення.
+      set next-opinion
+        (focal-opinion + sum [previous-opinion] of accepted-neighbors)
+        / (1 + received-wom-count)
     ]
   ]
-end
 
-
-;; HIGH-INVOLVEMENT PURCHASE
-;; Цілеспрямований пошук інформації: кожен покупець звертається до всіх
-;; своїх безпосередніх знайомих. Кожен знайомий ділиться думкою з
-;; імовірністю, що залежить від talk-propensity та сили opinion.
-;; Покупець агрегує всі повідомлення, що потрапили в confidence-bound.
-to perform-high-involvement-wom
-  ask shoppers with [any? link-neighbors] [
-    let listener self
-
-    ask link-neighbors [
-      let share-probability clamp (talk-propensity * abs opinion) 0 1
-
-      if random-float 1 < share-probability [
-        set spoke-wom? true
-        let message outgoing-wom-message
-
-        ask listener [
-          let discrepancy abs (message - opinion)
-
-          if discrepancy <= confidence-bound [
-            set received-wom received-wom + message
-            set received-wom-count received-wom-count + 1
-          ]
-        ]
-      ]
-    ]
+  ask shoppers [
+    set wom-opinion-change next-opinion - previous-opinion
+    set opinion clamp next-opinion -1 1
   ]
 end
 
 
-;; Оновлення виконується один раз після завершення всіх комунікацій.
-;; social-susceptibility визначає силу зміни після того, як повідомлення
-;; вже пройшли фільтр прийняття.
-to apply-received-wom
-  ask shoppers with [received-wom-count > 0] [
-    let old-opinion opinion
-    let social-signal received-wom / received-wom-count
-
-    set opinion clamp
-      (opinion + social-susceptibility * (social-signal - opinion))
-      -1 1
-
-    set wom-opinion-change opinion - old-opinion
+;; Імовірність прийняття чужої думки.
+;; acceptance-facilitation = 1 створює жорсткий bounded-confidence:
+;; усередині confidence-bound імовірність дорівнює 1.
+;; Менші значення формують плавне спадання імовірності з відстанню.
+;; baseline-acceptance задає мінімальну імовірність прийняття,
+;; зокрема для opinions за межами confidence-bound.
+to-report probability-acceptance [discrepancy]
+  if discrepancy > confidence-bound [
+    report baseline-acceptance
   ]
+
+  if acceptance-facilitation >= 1 [
+    report 1
+  ]
+
+  if acceptance-facilitation <= 0 [
+    report baseline-acceptance
+  ]
+
+  let shape-parameter
+    (1 / (1 - acceptance-facilitation ^ 2)) - 1
+
+  if shape-parameter <= 0 [
+    report baseline-acceptance
+  ]
+
+  let normalized-distance discrepancy / confidence-bound
+  let bounded-probability
+    (1 - normalized-distance) ^ (1 / shape-parameter)
+
+  report clamp
+    (max list baseline-acceptance bounded-probability)
+    0 1
 end
 
 
-;; Повідомлення поєднує накопичене ставлення та останній досвід.
-;; Opinion робить сигнал стабільним, satisfaction дозволяє швидко
-;; поширювати реакцію на поточну покупку або активну винагороду.
-to-report outgoing-wom-message
-  report clamp (0.7 * opinion + 0.3 * satisfaction) -1 1
-end
-
-
-;; Частка агентів, які прийняли хоча б одне WOM-повідомлення.
+;; Частка агентів, які прийняли хоча б одну сусідську opinion.
 to-report wom-receiver-share
   if not any? shoppers [ report 0 ]
   report count shoppers with [received-wom-count > 0] / count shoppers
 end
 
 
-;; Середній абсолютний зсув opinion, без взаємного погашення позитивних
+;; Середній абсолютний зсув opinion, спричинений мережевим узгодженням,
 ;; і негативних змін.
 to-report mean-absolute-wom-opinion-change
   if not any? shoppers [ report 0 ]
@@ -1080,9 +1074,15 @@ to-report mean-opinion [group-name]
 end
 
 
-to-report wom-speaker-share
+to-report opinion-standard-deviation
+  if count shoppers < 2 [ report 0 ]
+  report standard-deviation [opinion] of shoppers
+end
+
+
+to-report opinion-range
   if not any? shoppers [ report 0 ]
-  report count shoppers with [spoke-wom?] / count shoppers
+  report max [opinion] of shoppers - min [opinion] of shoppers
 end
 
 
@@ -1097,7 +1097,6 @@ end
 ;; =========================================================
 
 to update-visualization
-  ask links [ set hidden? not show-network? ]
 
   ask shoppers [
     ;; X = intrinsic motivation; Y = habit strength.
@@ -1206,56 +1205,10 @@ to-report behaviorsearch-fitness-no-crowding
 end
 ]]></code>
   <widgets>
-    <view x="455" wrappingAllowedX="false" y="15" frameRate="30.0" minPycor="-16" height="515" showTickCounter="true" patchSize="15.5" fontSize="10" wrappingAllowedY="false" width="515" tickCounterLabel="ticks" maxPycor="16" updateMode="0" maxPxcor="16" minPxcor="-16"></view>
-    <slider x="30" step="1" y="115" max="6" display="reward-cycles" height="33" min="0" direction="Horizontal" default="1.0" variable="reward-cycles" width="125" sizeVersion="0"></slider>
-    <slider x="30" step="5" y="158" max="200" display="reward-duration" height="33" min="10" direction="Horizontal" default="60.0" variable="reward-duration" width="140" sizeVersion="0"></slider>
-    <slider x="30" step="0.05" y="200" max="1" display="low-reward-salience" height="33" min="0" direction="Horizontal" default="0.15" variable="low-reward-salience" width="175" sizeVersion="0"></slider>
-    <slider x="215" step="0.05" y="200" max="1" display="high-reward-salience" height="33" min="0" direction="Horizontal" default="0.9" variable="high-reward-salience" width="175" sizeVersion="0"></slider>
-    <plot x="985" autoPlotX="true" yMax="0.5" autoPlotY="false" y="630" xMin="0.0" height="195" legend="true" xMax="160.0" yMin="-0.5" width="390" display="Intrinsic Motivation Gap vs Control">
-      <setup></setup>
-      <update></update>
-      <pen interval="1.0" mode="0" display="Low salience - control" color="-11221820" legend="true">
-        <setup></setup>
-        <update>plotxy ticks (
-  mean [intrinsic-motivation] of shoppers with [treatment-group = "low-salience"]
-  - mean [intrinsic-motivation] of shoppers with [treatment-group = "control"]
-)</update>
-      </pen>
-      <pen interval="1.0" mode="0" display="High salience - control" color="-2674135" legend="true">
-        <setup></setup>
-        <update>plotxy ticks (
-  mean [intrinsic-motivation] of shoppers with [treatment-group = "high-salience"]
-  - mean [intrinsic-motivation] of shoppers with [treatment-group = "control"]
-)</update>
-      </pen>
-      <pen interval="1.0" mode="0" display="Zero reference" color="-7500403" legend="false">
-        <setup></setup>
-        <update>plotxy ticks 0</update>
-      </pen>
-    </plot>
-    <plot x="985" autoPlotX="true" yMax="1.0" autoPlotY="false" y="430" xMin="0.0" height="195" legend="true" xMax="160.0" yMin="0.0" width="390" display="Mean Habit Strength">
-      <setup></setup>
-      <update></update>
-      <pen interval="1.0" mode="0" display="Control" color="-15575016" legend="true">
-        <setup></setup>
-        <update>plotxy ticks mean [habit] of shoppers with [
-    treatment-group = "control"
-]</update>
-      </pen>
-      <pen interval="1.0" mode="0" display="Low salience" color="-11221820" legend="true">
-        <setup></setup>
-        <update>plotxy ticks mean [habit] of shoppers with [
-    treatment-group = "low-salience"
-]</update>
-      </pen>
-      <pen interval="1.0" mode="0" display="High salience" color="-2674135" legend="true">
-        <setup></setup>
-        <update>plotxy ticks mean [habit] of shoppers with [
-    treatment-group = "high-salience"
-]</update>
-      </pen>
-    </plot>
-    <plot x="985" autoPlotX="true" yMax="1.0" autoPlotY="false" y="240" xMin="0.0" height="185" legend="true" xMax="160.0" yMin="0.0" width="390" display="Mean Intrinsic Motivation">
+    <view x="455" wrappingAllowedX="false" y="15" frameRate="30.0" minPycor="-16" height="10" showTickCounter="false" patchSize="0.3" fontSize="10" wrappingAllowedY="false" width="10" tickCounterLabel="ticks" maxPycor="16" updateMode="0" maxPxcor="16" minPxcor="-16"></view>
+    <button x="90" y="15" height="40" disableUntilTicks="false" forever="true" kind="Observer" width="55">go</button>
+    <slider x="170" step="20" y="20" max="3000" display="number-of-shoppers" height="33" min="20" direction="Horizontal" default="1000.0" variable="number-of-shoppers" width="170" sizeVersion="0"></slider>
+    <plot x="985" autoPlotX="true" yMax="1.0" autoPlotY="false" y="15" xMin="0.0" height="185" legend="true" xMax="160.0" yMin="0.0" display="Mean Intrinsic Motivation" width="390" sizeVersion="0">
       <setup></setup>
       <update></update>
       <pen interval="1.0" mode="0" display="Control" color="-15575016" legend="true">
@@ -1277,7 +1230,8 @@ end
 ]</update>
       </pen>
     </plot>
-    <plot x="985" autoPlotX="true" yMax="1.0" autoPlotY="true" y="10" xMin="0.0" height="220" legend="true" xMax="0.0" yMin="0.0" width="390" display="Target choice rate">
+    <note x="30" y="80" backgroundDark="603979776" fontSize="12" width="150" markdown="false" height="25" textColorDark="-1" textColorLight="-16777216" backgroundLight="603979776">Loyalty program</note>
+    <plot x="455" autoPlotX="true" yMax="1.0" autoPlotY="false" y="15" xMin="0.0" height="445" legend="true" xMax="0.0" yMin="0.0" width="515" display="Target choice rate">
       <setup></setup>
       <update></update>
       <pen interval="1.0" mode="0" display="Control" color="-15575016" legend="true">
@@ -1305,7 +1259,7 @@ end
 ]</update>
       </pen>
     </plot>
-    <plot x="1385" autoPlotX="true" yMax="1.0" autoPlotY="false" y="10" xMin="0.0" height="270" legend="true" xMax="160.0" yMin="0.0" width="390" display="Persistence after reward withdrawal">
+    <plot x="1385" autoPlotX="true" yMax="0.75" autoPlotY="false" y="15" xMin="0.0" height="185" legend="true" xMax="160.0" yMin="0.25" display="Persistence after reward withdrawal" width="390" sizeVersion="0">
       <setup></setup>
       <update></update>
       <pen interval="1.0" mode="0" display="Control" color="-15575016" legend="true">
@@ -1321,27 +1275,52 @@ end
         <update><![CDATA[if final-withdrawal-ticks-completed > 0 [ plotxy ticks persistence "high-salience" ]]]></update>
       </pen>
     </plot>
-    <plot x="1385" autoPlotX="true" yMax="0.5" autoPlotY="false" y="290" xMin="0.0" height="395" legend="true" xMax="160.0" yMin="-0.5" width="390" display="Persistence Index">
+    <button x="30" y="15" height="40" disableUntilTicks="false" forever="false" kind="Observer" width="55">setup</button>
+    <plot x="1385" autoPlotX="true" yMax="0.5" autoPlotY="false" y="400" xMin="0.0" height="195" legend="true" xMax="160.0" yMin="-0.5" display="Intrinsic Motivation Gap vs Control" width="390" sizeVersion="0">
+      <setup></setup>
+      <update></update>
+      <pen interval="1.0" mode="0" display="Low salience - control" color="-11221820" legend="true">
+        <setup></setup>
+        <update>plotxy ticks (
+  mean [intrinsic-motivation] of shoppers with [treatment-group = "low-salience"]
+  - mean [intrinsic-motivation] of shoppers with [treatment-group = "control"]
+)</update>
+      </pen>
+      <pen interval="1.0" mode="0" display="High salience - control" color="-2674135" legend="true">
+        <setup></setup>
+        <update>plotxy ticks (
+  mean [intrinsic-motivation] of shoppers with [treatment-group = "high-salience"]
+  - mean [intrinsic-motivation] of shoppers with [treatment-group = "control"]
+)</update>
+      </pen>
+      <pen interval="1.0" mode="0" display="Zero reference" color="-7500403" legend="false">
+        <setup></setup>
+        <update>plotxy ticks 0</update>
+      </pen>
+    </plot>
+    <plot x="1385" autoPlotX="true" yMax="1.0" autoPlotY="false" y="210" xMin="0.0" height="195" legend="true" xMax="160.0" yMin="0.0" display="Mean Habit Strength" width="390" sizeVersion="0">
       <setup></setup>
       <update></update>
       <pen interval="1.0" mode="0" display="Control" color="-15575016" legend="true">
         <setup></setup>
-        <update><![CDATA[if final-withdrawal-ticks-completed > 0 [ plotxy ticks persistence-index "control" ]]]></update>
+        <update>plotxy ticks mean [habit] of shoppers with [
+    treatment-group = "control"
+]</update>
       </pen>
       <pen interval="1.0" mode="0" display="Low salience" color="-11221820" legend="true">
         <setup></setup>
-        <update><![CDATA[if final-withdrawal-ticks-completed > 0 [ plotxy ticks persistence-index "low-salience" ]]]></update>
+        <update>plotxy ticks mean [habit] of shoppers with [
+    treatment-group = "low-salience"
+]</update>
       </pen>
       <pen interval="1.0" mode="0" display="High salience" color="-2674135" legend="true">
         <setup></setup>
-        <update><![CDATA[if final-withdrawal-ticks-completed > 0 [ plotxy ticks persistence-index "high-salience" ]]]></update>
-      </pen>
-      <pen interval="1.0" mode="0" display="Zero reference" color="-7500403" legend="false">
-        <setup></setup>
-        <update><![CDATA[if final-withdrawal-ticks-completed > 0 [ plotxy ticks 0 ]]]></update>
+        <update>plotxy ticks mean [habit] of shoppers with [
+    treatment-group = "high-salience"
+]</update>
       </pen>
     </plot>
-    <plot x="1385" autoPlotX="true" yMax="1.0" autoPlotY="false" y="700" xMin="0.0" height="220" legend="true" xMax="160.0" yMin="-1.0" width="390" display="Mean Satisfaction">
+    <plot x="985" autoPlotX="true" yMax="1.0" autoPlotY="false" y="205" xMin="0.0" height="220" legend="true" xMax="160.0" yMin="-1.0" display="Mean Satisfaction" width="390" sizeVersion="0">
       <setup></setup>
       <update></update>
       <pen interval="1.0" mode="0" display="Control" color="-10899396" legend="true">
@@ -1357,7 +1336,7 @@ end
         <update>plot mean-satisfaction "high-salience"</update>
       </pen>
     </plot>
-    <plot x="1385" autoPlotX="true" yMax="1.0" autoPlotY="false" y="930" xMin="0.0" height="220" legend="true" xMax="160.0" yMin="-1.0" width="390" display="Mean Opinion">
+    <plot x="990" autoPlotX="true" yMax="1.0" autoPlotY="false" y="430" xMin="0.0" height="220" legend="true" xMax="160.0" yMin="-1.0" display="Mean Opinion" width="390" sizeVersion="0">
       <setup></setup>
       <update></update>
       <pen interval="1.0" mode="0" display="Control" color="-10899396" legend="true">
@@ -1373,51 +1352,48 @@ end
         <update>plot mean-opinion "high-salience"</update>
       </pen>
     </plot>
-    <note x="35" y="265" backgroundDark="0" fontSize="12" width="240" markdown="false" height="25" textColorDark="-1" textColorLight="-16777216" backgroundLight="0">Social network and WOM</note>
-    <switch x="180" y="300" height="35" on="false" variable="show-network?" display="show-network?" width="150" sizeVersion="0"></switch>
-    <note x="30" y="80" backgroundDark="0" fontSize="12" width="150" markdown="false" height="25" textColorDark="-1" textColorLight="-16777216" backgroundLight="0">Loyalty program</note>
-    <note x="600" y="655" backgroundDark="0" fontSize="12" width="230" markdown="false" height="30" textColorDark="-1" textColorLight="-16777216" backgroundLight="0">Persistence Index (post − baseline)</note>
-    <monitor x="510" precision="3" y="690" height="60" fontSize="11" display="Control" width="105" sizeVersion="0">persistence-index "control"</monitor>
-    <monitor x="642" precision="3" y="690" height="60" fontSize="11" display="Low Salience" width="100" sizeVersion="0">persistence-index "low-salience"</monitor>
-    <monitor x="770" precision="3" y="690" height="60" fontSize="11" display="High Salience" width="100" sizeVersion="0">persistence-index "high-salience"</monitor>
-    <chooser x="35" y="345" height="55" variable="network-topology" current="0" display="network-topology" width="190" sizeVersion="0">
+    <plot x="455" autoPlotX="true" yMax="10.0" autoPlotY="true" y="470" xMin="0.0" height="195" legend="false" xMax="10.0" yMin="0.0" display="Opinion distribution" width="515" sizeVersion="0">
+      <setup>clear-plot
+set-plot-x-range -1 1</setup>
+      <update></update>
+      <pen interval="1.0" mode="1" display="default" color="-16777216" legend="true">
+        <setup></setup>
+        <update>clear-plot
+set-plot-x-range -1 1
+set-histogram-num-bars 40
+histogram [opinion] of shoppers</update>
+      </pen>
+    </plot>
+    <slider x="200" step="1" y="80" max="6" display="reward-cycles" height="33" min="0" direction="Horizontal" default="1.0" variable="reward-cycles" width="125" sizeVersion="0"></slider>
+    <slider x="30" step="5" y="125" max="200" display="reward-duration" height="33" min="10" direction="Horizontal" default="60.0" variable="reward-duration" width="140" sizeVersion="0"></slider>
+    <slider x="200" step="5" y="120" max="200" display="withdrawal-duration" height="33" min="10" direction="Horizontal" default="60.0" variable="withdrawal-duration" width="175" sizeVersion="0"></slider>
+    <slider x="30" step="0.05" y="160" max="1" display="low-reward-salience" height="33" min="0" direction="Horizontal" default="0.15" variable="low-reward-salience" width="165" sizeVersion="0"></slider>
+    <slider x="200" step="0.05" y="160" max="1" display="high-reward-salience" height="33" min="0" direction="Horizontal" default="0.9" variable="high-reward-salience" width="175" sizeVersion="0"></slider>
+    <note x="30" y="210" backgroundDark="603979776" fontSize="12" width="240" markdown="false" height="25" textColorDark="-1" textColorLight="-16777216" backgroundLight="603979776">Social network and WOM</note>
+    <switch x="280" y="210" height="35" on="true" variable="wom-on?" display="wom-on?" width="130" sizeVersion="0"></switch>
+    <chooser x="30" y="255" height="55" variable="network-topology" current="1" display="network-topology" width="190" sizeVersion="0">
       <choice type="string" value="small-world"></choice>
       <choice type="string" value="preferential-attachment"></choice>
       <choice type="string" value="ring-lattice"></choice>
       <choice type="string" value="random"></choice>
     </chooser>
-    <slider x="215" step="5" y="158" max="200" display="withdrawal-duration" height="33" min="10" direction="Horizontal" default="60.0" variable="withdrawal-duration" width="175" sizeVersion="0"></slider>
-    <monitor x="770" precision="3" y="575" height="60" fontSize="11" display="High Salience" width="100" sizeVersion="0">persistence "high-salience"</monitor>
-    <monitor x="642" precision="3" y="575" height="60" fontSize="11" display="Low Salience" width="100" sizeVersion="0">persistence "low-salience"</monitor>
-    <monitor x="510" precision="3" y="575" height="60" fontSize="11" display="Control" width="105" sizeVersion="0">persistence "control"</monitor>
-    <button x="30" y="15" height="40" disableUntilTicks="false" forever="false" kind="Observer" width="55">setup</button>
-    <slider x="240" step="2" y="345" max="20" display="network-degree" height="33" min="2" direction="Horizontal" default="6.0" variable="network-degree" width="180" sizeVersion="0"></slider>
-    <note x="605" y="550" backgroundDark="0" fontSize="12" width="220" markdown="false" height="30" textColorDark="-1" textColorLight="-16777216" backgroundLight="0">Persistence (final withdrawal)</note>
-    <button x="90" y="15" height="40" disableUntilTicks="false" forever="true" kind="Observer" width="55">go</button>
-    <slider x="170" step="20" y="20" max="3000" display="number-of-shoppers" height="33" min="20" direction="Horizontal" default="1000.0" variable="number-of-shoppers" width="170" sizeVersion="0"></slider>
-    <switch x="35" y="300" height="35" on="true" variable="wom-on?" display="wom-on?" width="130" sizeVersion="0"></switch>
-    <monitor x="25" precision="4" y="890" height="60" fontSize="11" width="195" display="WOM receiver share">wom-receiver-share</monitor>
-    <monitor x="25" precision="17" y="520" height="60" fontSize="11" width="205">current-phase</monitor>
-    <monitor x="240" precision="2" y="655" height="60" fontSize="11" width="195" display="Mean network degree">mean-network-degree</monitor>
-    <monitor x="25" precision="3" y="655" height="60" fontSize="11" width="205" display="WOM speaker share">wom-speaker-share</monitor>
-    <monitor x="240" precision="3" y="585" height="60" fontSize="11" width="200">low-reward-persistence-effect</monitor>
-    <monitor x="25" precision="3" y="585" height="60" fontSize="11" width="205">high-reward-crowding-out-effect</monitor>
-    <monitor x="240" precision="0" y="520" height="60" fontSize="11" width="200" display="current-cycle">current-cycle</monitor>
-    <monitor x="25" precision="4" y="830" height="60" fontSize="11" width="170" display="Mean received-wom-count">mean [received-wom-count] of shoppers</monitor>
-    <monitor x="230" precision="4" y="830" height="60" fontSize="11" width="205" display="Mean average received WOM"><![CDATA[mean [received-wom / received-wom-count] of shoppers with [received-wom-count > 0]]]></monitor>
-    <monitor x="230" precision="4" y="890" height="60" fontSize="11" width="195" display="Mean |WOM opinion change|">mean-absolute-wom-opinion-change</monitor>
-    <monitor x="305" precision="4" y="745" height="60" fontSize="11" width="135">wom-speaker-share</monitor>
-    <monitor x="165" precision="4" y="745" height="60" fontSize="11" width="130" display="StdDev Opinion">standard-deviation [opinion] of shoppers</monitor>
-    <monitor x="25" precision="4" y="745" height="60" fontSize="11" width="130" display="Mean opinion">mean [opinion] of shoppers</monitor>
-    <slider x="240" step="0.05" y="475" max="2" display="confidence-bound" height="33" min="0.05" direction="Horizontal" default="0.75" variable="confidence-bound" width="175" sizeVersion="0"></slider>
-    <chooser x="30" y="455" height="55" variable="purchase-deliberation-mode" current="1" display="purchase-deliberation-mode" width="200" sizeVersion="0">
-      <choice type="string" value="low-involvement"></choice>
-      <choice type="string" value="high-involvement"></choice>
-    </chooser>
-    <slider x="240" step="0.25" y="440" max="3" display="opinion-weight" height="33" min="0" direction="Horizontal" default="0.75" variable="opinion-weight" width="175" sizeVersion="0"></slider>
-    <slider x="240" step="0.05" y="380" max="1" display="rewiring-probability" height="33" min="0" direction="Horizontal" default="0.15" variable="rewiring-probability" width="180" sizeVersion="0"></slider>
+    <slider x="235" step="0.05" y="290" max="1" display="rewiring-probability" height="33" min="0" direction="Horizontal" default="0.2" variable="rewiring-probability" width="180" sizeVersion="0"></slider>
+    <slider x="235" step="2" y="255" max="20" display="network-degree" height="33" min="2" direction="Horizontal" default="10.0" variable="network-degree" width="180" sizeVersion="0"></slider>
+    <slider x="30" step="0.05" y="330" max="1" display="acceptance-facilitation" height="33" min="0" direction="Horizontal" default="1.0" variable="acceptance-facilitation" width="190" sizeVersion="0"></slider>
+    <monitor x="235" precision="4" y="630" height="45" fontSize="11" display="Mean |WOM opinion change|" width="195" sizeVersion="0">mean-absolute-wom-opinion-change</monitor>
+    <monitor x="30" precision="4" y="630" height="45" fontSize="11" display="Network opinion receiver share" width="195" sizeVersion="0">wom-receiver-share</monitor>
+    <monitor x="235" precision="4" y="570" height="45" fontSize="11" display="StdDev Opinion" width="130" sizeVersion="0">standard-deviation [opinion] of shoppers</monitor>
+    <monitor x="30" precision="4" y="570" height="45" fontSize="11" display="Mean opinion" width="130" sizeVersion="0">mean [opinion] of shoppers</monitor>
+    <monitor x="240" precision="3" y="510" height="45" fontSize="11" width="180" sizeVersion="0">low-reward-persistence-effect</monitor>
+    <monitor x="240" precision="0" y="460" height="45" fontSize="11" display="current-cycle" width="180" sizeVersion="0">current-cycle</monitor>
+    <monitor x="30" precision="3" y="510" height="45" fontSize="11" width="185" sizeVersion="0">high-reward-crowding-out-effect</monitor>
+    <monitor x="30" precision="17" y="460" height="45" fontSize="11" width="185" sizeVersion="0">current-phase</monitor>
+    <slider x="30" step="0.005" y="370" max="0.2" display="opinion-mutation-rate" height="33" min="0" direction="Horizontal" default="0.065" variable="opinion-mutation-rate" width="190" sizeVersion="0"></slider>
+    <slider x="30" step="0.25" y="410" max="5" display="opinion-weight" height="33" min="0" direction="Horizontal" default="3.0" variable="opinion-weight" width="190" sizeVersion="0"></slider>
+    <slider x="240" step="0.05" y="410" max="2" display="confidence-bound" height="33" min="0.05" direction="Horizontal" default="0.1" variable="confidence-bound" width="180" sizeVersion="0"></slider>
+    <slider x="240" step="0.01" y="330" max="1" display="baseline-acceptance" height="33" min="0" direction="Horizontal" default="0.0" variable="baseline-acceptance" width="180" sizeVersion="0"></slider>
   </widgets>
-  <info># Агентна модель програм лояльності, satisfaction, opinion і WOM
+  <info><![CDATA[# Агентна модель програм лояльності, satisfaction, opinion і WOM
 
 ## Призначення
 
@@ -1597,7 +1573,30 @@ All experiments use 30 repetitions per configuration and record behavior, motiva
 - `high-involvement`: покупець сам звертається до всіх безпосередніх знайомих у своїй мережі, збирає доступні рекомендації та агрегує прийняті думки. Режим відповідає дорогим покупкам із цілеспрямованим пошуком інформації.
 
 `confidence-bound` задає максимальну допустиму різницю між поточним opinion покупця та отриманою рекомендацією. Повідомлення поза цією межею ігноруються. `social-susceptibility` визначає силу зміни opinion уже після прийняття повідомлення.
-</info>
+
+
+## Decision structure with and without the network mechanism
+
+**WOM OFF**
+
+`price + intrinsic motivation + habit + reward -> target choice`
+
+Opinion does not enter the decision utility and is not updated from satisfaction.
+
+**WOM ON**
+
+`satisfaction -> individual opinion -> probabilistic bounded-confidence network update`
+
+Then:
+
+`price + intrinsic motivation + habit + reward + opinion -> target choice`
+
+The network mechanism is an adaptation of the opinion dynamics used in
+`codbc_m_eps_f_beta`: opinions are read from the previous synchronous state,
+neighbors are accepted probabilistically according to opinion discrepancy,
+and the new opinion is the mean of the agent's own opinion and accepted
+neighbor opinions.
+]]></info>
   <turtleShapes>
     <shape name="default" rotatable="true" editableColorIndex="0">
       <polygon color="-1920102913" filled="true" marked="true">
@@ -2472,6 +2471,15 @@ setup</setup>
         <enumeratedValueSet variable="high-reward-salience">
           <value value="0.9"></value>
         </enumeratedValueSet>
+        <enumeratedValueSet variable="acceptance-facilitation">
+          <value value="1"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="baseline-acceptance">
+          <value value="0"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="opinion-mutation-rate">
+          <value value="0"></value>
+        </enumeratedValueSet>
       </constants>
     </experiment>
     <experiment name="E1 reward magnitude and crowding-out" repetitions="30" sequentialRunOrder="true" runMetricsEveryStep="false">
@@ -2528,6 +2536,15 @@ setup</setup>
           <value value="0.75"></value>
           <value value="0.85"></value>
           <value value="0.95"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="acceptance-facilitation">
+          <value value="1"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="baseline-acceptance">
+          <value value="0"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="opinion-mutation-rate">
+          <value value="0"></value>
         </enumeratedValueSet>
       </constants>
     </experiment>
@@ -2588,6 +2605,15 @@ setup</setup>
           <value value="0.85"></value>
           <value value="0.95"></value>
         </enumeratedValueSet>
+        <enumeratedValueSet variable="acceptance-facilitation">
+          <value value="1"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="baseline-acceptance">
+          <value value="0"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="opinion-mutation-rate">
+          <value value="0"></value>
+        </enumeratedValueSet>
       </constants>
     </experiment>
     <experiment name="E3 repeated campaign structure" repetitions="30" sequentialRunOrder="true" runMetricsEveryStep="false">
@@ -2647,6 +2673,15 @@ setup</setup>
           <value value="0.75"></value>
           <value value="0.9"></value>
         </enumeratedValueSet>
+        <enumeratedValueSet variable="acceptance-facilitation">
+          <value value="1"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="baseline-acceptance">
+          <value value="0"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="opinion-mutation-rate">
+          <value value="0"></value>
+        </enumeratedValueSet>
       </constants>
     </experiment>
     <experiment name="E4 statistical forecasting benchmark" repetitions="30" sequentialRunOrder="true" runMetricsEveryStep="true">
@@ -2687,6 +2722,15 @@ setup</setup>
           <value value="0.75"></value>
           <value value="0.9"></value>
         </enumeratedValueSet>
+        <enumeratedValueSet variable="acceptance-facilitation">
+          <value value="1"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="baseline-acceptance">
+          <value value="0"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="opinion-mutation-rate">
+          <value value="0"></value>
+        </enumeratedValueSet>
       </constants>
     </experiment>
     <experiment name="E5 WOM withdrawal compensation calibration" repetitions="30" sequentialRunOrder="true" runMetricsEveryStep="false">
@@ -2707,6 +2751,8 @@ setup</setup>
         <metric>wom-receiver-share</metric>
         <metric>mean-absolute-wom-opinion-change</metric>
         <metric>mean-network-degree</metric>
+        <metric>opinion-standard-deviation</metric>
+        <metric>opinion-range</metric>
       </metrics>
       <constants>
         <enumeratedValueSet variable="number-of-shoppers">
@@ -2755,6 +2801,103 @@ setup</setup>
         </enumeratedValueSet>
         <enumeratedValueSet variable="show-network?">
           <value value="false"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="acceptance-facilitation">
+          <value value="1"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="baseline-acceptance">
+          <value value="0"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="opinion-mutation-rate">
+          <value value="0"></value>
+        </enumeratedValueSet>
+      </constants>
+    </experiment>
+    <experiment name="E6 opinion-weight" repetitions="30" sequentialRunOrder="true" runMetricsEveryStep="false">
+      <setup>setup</setup>
+      <go>go</go>
+      <exitCondition>simulation-finished?</exitCondition>
+      <metrics>
+        <metric>choice-rate "high-salience" "baseline"</metric>
+        <metric>choice-rate "high-salience" "reward"</metric>
+        <metric>final-withdrawal-choice-rate "high-salience"</metric>
+        <metric>high-reward-withdrawal-drop</metric>
+        <metric>high-reward-retention-ratio</metric>
+        <metric>persistence-index "high-salience"</metric>
+        <metric>mean-intrinsic-motivation "high-salience"</metric>
+        <metric>mean-habit "high-salience"</metric>
+        <metric>mean-opinion "high-salience"</metric>
+        <metric>wom-speaker-share</metric>
+        <metric>wom-receiver-share</metric>
+        <metric>mean-absolute-wom-opinion-change</metric>
+        <metric>mean-network-degree</metric>
+        <metric>opinion-standard-deviation</metric>
+        <metric>opinion-range</metric>
+      </metrics>
+      <constants>
+        <enumeratedValueSet variable="number-of-shoppers">
+          <value value="1000"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="reward-cycles">
+          <value value="1"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="reward-duration">
+          <value value="60"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="withdrawal-duration">
+          <value value="80"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="low-reward-salience">
+          <value value="0.15"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="high-reward-salience">
+          <value value="0.75"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="wom-on?">
+          <value value="true"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="network-topology">
+          <value value="&quot;preferential-attachment&quot;"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="network-degree">
+          <value value="6"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="rewiring-probability">
+          <value value="0.15"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="purchase-deliberation-mode">
+          <value value="&quot;low-involvement&quot;"></value>
+          <value value="&quot;high-involvement&quot;"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="confidence-bound">
+          <value value="0.25"></value>
+          <value value="0.5"></value>
+          <value value="0.75"></value>
+          <value value="0.9"></value>
+          <value value="1"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="show-network?">
+          <value value="false"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="opinion-weight">
+          <value value="0"></value>
+          <value value="0.5"></value>
+          <value value="1"></value>
+          <value value="1.5"></value>
+          <value value="2"></value>
+          <value value="2.5"></value>
+          <value value="3"></value>
+          <value value="4"></value>
+          <value value="5"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="acceptance-facilitation">
+          <value value="1"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="baseline-acceptance">
+          <value value="0"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="opinion-mutation-rate">
+          <value value="0"></value>
         </enumeratedValueSet>
       </constants>
     </experiment>
