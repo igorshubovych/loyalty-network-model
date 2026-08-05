@@ -202,6 +202,10 @@ to setup
   ;; Це усуває окремий повільний етап ручного створення links.
   setup-social-network
 
+  ;; M4. Assignment happens after the network so that treatment and
+  ;; network position are independent.
+  assign-treatment-groups
+
   reset-ticks
   update-simulation-state
   update-visualization
@@ -282,6 +286,19 @@ to validate-configuration
     error "opinion-mutation-rate must be in the range [0, 1]"
   ]
 
+  ;; Contracts for the parameters added in v13.
+  if choice-sharpness <= 0 [
+    error "choice-sharpness must be positive"
+  ]
+
+  if opinion-memory-rate <= 0 or opinion-memory-rate > 1 [
+    error "opinion-memory-rate must be in the range (0, 1]"
+  ]
+
+  if non-target-experience < -1 or non-target-experience > 1 [
+    error "non-target-experience must be in the range [-1, 1]"
+  ]
+
 end
 
 to initialize-system-state
@@ -308,21 +325,20 @@ to initialize-shopper-state
   set reward-sensitivity bounded-random-normal 2 0.25 1 3
   set autonomy-sensitivity bounded-random-normal 0.5 0.2 0 1
 
-  ;; Початковий satisfaction майже нейтральний, а opinion містить
-  ;; невеликий випадковий розкид. Надалі satisfaction замінюється
-  ;; після кожної покупки, тоді як opinion накопичує досвід.
+  ;; Початковий satisfaction майже нейтральний. Початковий opinion
+  ;; тепер задається chooser-ом initial-opinion-distribution, щоб можна
+  ;; було стартувати з різних форм громадської думки.
   set satisfaction bounded-random-normal 0 0.10 -1 1
-
-  ;; In the normal loyalty-model mode, initial opinions are concentrated near 0.
-  ;; In HK validation mode, a uniform distribution on [-1, 1] is used so that
-  ;; bounded-confidence clustering can emerge.
-  ifelse hk-validation-mode? [
-    set opinion random-float 2 - 1
-  ][
-    set opinion bounded-random-normal 0 0.15 -1 1
-  ]
-
-  set opinion-update-rate bounded-random-normal 0.25 0.1 0.05 0.80
+  set opinion initial-opinion-draw
+  ;; M2. The mean update rate is now a parameter. A low rate makes
+  ;; opinion a slow store of past experience rather than an echo of
+  ;; the last purchase. Spread and bounds scale with the mean so the
+  ;; population stays heterogeneous at every setting.
+  set opinion-update-rate bounded-random-normal
+    opinion-memory-rate
+    (0.40 * opinion-memory-rate)
+    (0.20 * opinion-memory-rate)
+    (min list 0.95 (2.50 * opinion-memory-rate))
 
   set previous-opinion opinion
   set next-opinion opinion
@@ -343,22 +359,43 @@ to initialize-shopper-state
 end
 
 
-to assign-treatment-group
-  ;; Детермінований розподіл забезпечує майже однаковий розмір груп.
-  if who mod 3 = 0 [
-    set treatment-group "control"
-    set color (lime - 3)
+;; M4. Treatment is assigned after the network exists, from a shuffled
+;; list of labels, so that group membership is statistically independent
+;; of network position. In v12 the rule was `who mod 3`, and because the
+;; nw generators build the network in creation order, treatment was
+;; locked to position: every ring neighbourhood held one agent of each
+;; group, and the three preferential-attachment seed hubs were one of
+;; each. Any topology-by-treatment result was confounded.
+;;
+;; The clean no-programme baseline is a separate run with
+;; reward-cycles = 0, in which no group ever receives a reward.
+to assign-treatment-groups
+  let group-labels []
+  let slot-index 0
+
+  repeat count shoppers [
+    set group-labels lput
+      (item (slot-index mod 3)
+        ["control" "low-salience" "high-salience"])
+      group-labels
+    set slot-index slot-index + 1
   ]
 
-  if who mod 3 = 1 [
-    set treatment-group "low-salience"
-    set color cyan
-  ]
+  set group-labels shuffle group-labels
 
-  if who mod 3 = 2 [
-    set treatment-group "high-salience"
-    set color red
-  ]
+  (foreach (sort shoppers) group-labels [
+    [the-shopper the-label] ->
+      ask the-shopper [ set treatment-group the-label ]
+  ])
+
+  ask shoppers [ apply-treatment-color ]
+end
+
+
+to apply-treatment-color
+  if treatment-group = "control" [ set color (lime - 3) ]
+  if treatment-group = "low-salience" [ set color cyan ]
+  if treatment-group = "high-salience" [ set color red ]
 end
 
 
@@ -423,10 +460,43 @@ to setup-social-network
 end
 
 
+;; Draws one shopper's starting opinion from the shape selected in the
+;; UI. "normal-around-0" reproduces the previous fixed behaviour and is
+;; the default; the guard falls back to it after loading older files.
+to-report initial-opinion-draw
+  if initial-opinion-distribution = "uniform" [
+    report random-float 2 - 1
+  ]
+
+  if initial-opinion-distribution = "bimodal" [
+    ;; Half the population starts mildly for, half mildly against.
+    let camp-center ifelse-value (random 2 = 0) [0.4] [-0.4]
+    report bounded-random-normal camp-center 0.15 -1 1
+  ]
+
+  if initial-opinion-distribution = "all-neutral" [
+    report 0
+  ]
+
+  report bounded-random-normal 0 0.15 -1 1
+end
+
+
+;; Habit value below which a share p of shoppers falls. p10 and p90
+;; together show whether the population is one group or two: when it
+;; splits, p10 stays low while p90 stays high.
+to-report habit-percentile [p]
+  if not any? shoppers [ report 0 ]
+  let vals sort [habit] of shoppers
+  report item (floor (p * (length vals - 1))) vals
+end
+
+
 ;; NW виконує цей блок для кожного щойно створеного агента.
+;; Treatment is no longer assigned here; see assign-treatment-groups,
+;; which runs once the whole network exists.
 to initialize-generated-shopper
   initialize-shopper-state
-  assign-treatment-group
 end
 
 
@@ -441,21 +511,16 @@ to go
 
   update-simulation-state
 
-  ifelse hk-validation-mode? [
-    ;; Pure HK-like validation:
-    ;; purchase, satisfaction, habit, motivation and target choice are frozen.
-    ;; Only synchronous probabilistic bounded-confidence dynamics is executed.
-    perform-word-of-mouth-step
-  ][
-    ;; Full loyalty-program model.
-    ask shoppers [
-      perform-shopper-step
-    ]
-
-    perform-word-of-mouth-step
-    record-system-state
+  ;; Усі агенти спочатку завершують вибір і оновлення власного стану.
+  ;; Лише після цього виконується WOM, щоб результат не залежав від
+  ;; випадкового порядку агентів усередині ask.
+  ask shoppers [
+    perform-shopper-step
   ]
 
+  perform-social-opinion-dynamics-step
+
+  record-system-state
   update-visualization
   tick
 end
@@ -557,7 +622,13 @@ to perform-shopper-step
   record-shopper-result
   update-behavioral-state
   update-satisfaction
-  update-opinion-from-experience
+
+  ;; У сценарії WOM OFF opinion не є частиною моделі прийняття рішення.
+  ;; У сценарії WOM ON власний досвід спочатку формує індивідуальну
+  ;; opinion, після чого вона проходить мережеве соціальне узгодження.
+  if wom-on? [
+    update-opinion-from-experience
+  ]
 end
 
 
@@ -572,8 +643,12 @@ to choose-behavior
 end
 
 
+;; M1. choice-sharpness multiplies the utility before the logistic.
+;; At 1.0 the rule is identical to v12. Above roughly 2.5 the
+;; choice-habit feedback becomes self-reinforcing for part of the
+;; population, which is what produces lock-in and inertia.
 to-report target-choice-probability
-  report logistic target-choice-utility
+  report logistic (choice-sharpness * target-choice-utility)
 end
 
 
@@ -603,8 +678,13 @@ end
 
 
 to-report opinion-contribution
-  ;; Opinion є довгостроковою ставленнєвою оцінкою. WOM впливає на
-  ;; вибір опосередковано: спершу змінює opinion, а вже opinion — utility.
+  ;; WOM OFF:
+  ;; price, intrinsic motivation, habit and reward determine target choice.
+  ;;
+  ;; WOM ON:
+  ;; satisfaction forms opinion; network bounded-confidence dynamics
+  ;; socially coordinates it; opinion then enters target-choice utility.
+  if not wom-on? [ report 0 ]
   report opinion-weight * opinion
 end
 
@@ -706,15 +786,22 @@ end
 ;; Satisfaction — оцінка саме поточної покупки. Випадковий шум
 ;; відображає варіативність обслуговування та суб'єктивного сприйняття.
 to update-satisfaction
-  let expected-experience -0.05
+  ;; M3. non-target-experience sets how negative a non-target purchase
+  ;; feels. A more negative value widens the opinion scale and creates
+  ;; a detractor pole, without which opinion clusters cannot separate.
+  let expected-experience non-target-experience
 
   if chose-target? [
     set expected-experience 0.25
 
-    ;; Бонус підвищує задоволеність лише тоді, коли він реально активний
-    ;; для treatment-групи й агент здійснив цільовий вибір.
-    set expected-experience expected-experience
-      + 0.45 * active-reward-salience
+    ;; M5. The reward reaches the choice a second time through this
+    ;; term: reward raises satisfaction, satisfaction raises opinion,
+    ;; and opinion enters the utility. The switch turns that indirect
+    ;; path off so the direct reward effect can be measured alone.
+    if reward-affects-satisfaction? [
+      set expected-experience expected-experience
+        + 0.45 * active-reward-salience
+    ]
   ]
 
   set satisfaction clamp
@@ -732,10 +819,15 @@ to update-opinion-from-experience
 end
 
 
-;; Мережеве opinion update адаптує probabilistic bounded-confidence
-;; dynamics із codbc_m_eps_f_beta до статичної соціальної мережі.
+;; Мережеве соціальне узгодження opinion адаптує probabilistic
+;; bounded-confidence dynamics із codbc_m_eps_f_beta до статичної
+;; соціальної мережі.
 ;;
-;; Власний досвід уже оновив opinion через satisfaction. Після цього:
+;; Повна логіка сценарію WOM ON:
+;; satisfaction -> individual opinion update -> network HK-like update
+;; -> opinion -> next target choice.
+;;
+;; Після оновлення opinion власним досвідом:
 ;; 1) opinions фіксуються в previous-opinion;
 ;; 2) кожен агент оцінює всіх безпосередніх link-neighbors;
 ;; 3) кожна сусідська думка приймається з імовірністю, яка залежить
@@ -743,7 +835,7 @@ end
 ;;    та baseline-acceptance;
 ;; 4) next-opinion дорівнює середньому власної та прийнятих думок;
 ;; 5) нові opinions застосовуються синхронно.
-to perform-word-of-mouth-step
+to perform-social-opinion-dynamics-step
   ask shoppers [
     set previous-opinion opinion
     set next-opinion opinion
@@ -751,24 +843,18 @@ to perform-word-of-mouth-step
     set wom-opinion-change 0
   ]
 
-  if not wom-on? and not hk-validation-mode? [ stop ]
+  if not wom-on? [ stop ]
 
   ask shoppers [
     ifelse random-float 1 < opinion-mutation-rate [
-      ;; External information shock, analogous to mutation in the reference model.
+      ;; Зовнішній інформаційний шок, аналог mutation у референтній моделі.
       set next-opinion random-float 2 - 1
     ]
     [
       let focal-agent self
       let focal-opinion previous-opinion
 
-      ;; The validation mode follows the well-mixed HK setting and considers
-      ;; the entire population. The applied loyalty model remains network-bound.
-      let candidate-shoppers ifelse-value hk-validation-mode?
-        [ other shoppers ]
-        [ link-neighbors ]
-
-      let accepted-neighbors candidate-shoppers with [
+      let accepted-neighbors link-neighbors with [
         random-float 1 <
           probability-acceptance
             (abs (previous-opinion - [previous-opinion] of focal-agent))
@@ -776,7 +862,7 @@ to perform-word-of-mouth-step
 
       set received-wom-count count accepted-neighbors
 
-      ;; The focal shopper's own opinion is always included in the average.
+      ;; Власна думка завжди входить до множини усереднення.
       set next-opinion
         (focal-opinion + sum [previous-opinion] of accepted-neighbors)
         / (1 + received-wom-count)
@@ -826,14 +912,14 @@ to-report probability-acceptance [discrepancy]
 end
 
 
-;; Частка агентів, які прийняли хоча б одне WOM-повідомлення.
+;; Частка агентів, які прийняли хоча б одну сусідську opinion.
 to-report wom-receiver-share
   if not any? shoppers [ report 0 ]
   report count shoppers with [received-wom-count > 0] / count shoppers
 end
 
 
-;; Середній абсолютний зсув opinion, без взаємного погашення позитивних
+;; Середній абсолютний зсув opinion, спричинений мережевим узгодженням,
 ;; і негативних змін.
 to-report mean-absolute-wom-opinion-change
   if not any? shoppers [ report 0 ]
@@ -1090,6 +1176,31 @@ to-report opinion-range
 end
 
 
+;; Share of shoppers sitting in the high-repetition state. Together
+;; with share-locked-out this shows whether the population has split
+;; into two stable behavioural groups, which is what M1 is meant to
+;; make possible and what a single mean value hides.
+to-report share-locked-in
+  if not any? shoppers [ report 0 ]
+  report count shoppers with [habit >= 0.70] / count shoppers
+end
+
+
+;; Share of shoppers sitting in the low-repetition state.
+to-report share-locked-out
+  if not any? shoppers [ report 0 ]
+  report count shoppers with [habit <= 0.30] / count shoppers
+end
+
+
+;; A wide spread of habit values means the population is split; a narrow
+;; one means everybody behaves in much the same way.
+to-report habit-standard-deviation
+  if count shoppers < 2 [ report 0 ]
+  report standard-deviation [habit] of shoppers
+end
+
+
 to-report mean-network-degree
   if not any? shoppers [ report 0 ]
   report mean [count link-neighbors] of shoppers
@@ -1107,10 +1218,10 @@ to update-visualization
     let x-position scale-value intrinsic-motivation min-pxcor max-pxcor
     let y-position scale-value habit min-pycor max-pycor
 
-    ;; Невеликий jitter зменшує повне накладання агентів.
-    set x-position x-position + random-float 0.3 - 0.15
-    set y-position y-position + random-float 0.3 - 0.15
-
+    ;; The jitter that used to sit here drew two random numbers per
+    ;; shopper per tick, in headless BehaviorSpace runs as well as in
+    ;; the interface. That tied every result to the display code and to
+    ;; the population size. It has been removed.
     setxy
       clamp x-position min-pxcor max-pxcor
       clamp y-position min-pycor max-pycor
@@ -1182,10 +1293,19 @@ end
 ;; 3) reward preservation of intrinsic motivation relative to control;
 ;; 4) penalize more intensive/costly campaign configurations.
 ;; Expected approximate scale is around 0 to 0.35 for the current model.
+;; The motivation term measures intrinsic motivation directly. It used
+;; to resolve to high-reward-crowding-out-effect, which is a difference
+;; of two choice rates, so motivation was never measured and the
+;; high-salience final-withdrawal rate entered the objective twice.
+;; Note that control shoppers receive no motivational update at all, so
+;; this gap is one-sided by construction: it can show a treated group
+;; falling below a static control, not a trend common to both.
 to-report behaviorsearch-fitness
   let durability persistence-index "high-salience"
   let uptake choice-rate "high-salience" "reward"
-  let motivation-gap high-reward-crowding-out-effect
+  let motivation-gap
+    mean-intrinsic-motivation "high-salience"
+    - mean-intrinsic-motivation "control"
   let policy-cost behaviorsearch-normalized-cost
 
   report durability
@@ -1196,10 +1316,13 @@ end
 
 ;; Alternative constrained-style objective. A negative motivation gap
 ;; is penalized more strongly, while a positive gap receives no bonus.
+;; Same motivation correction as in behaviorsearch-fitness above.
 to-report behaviorsearch-fitness-no-crowding
   let durability persistence-index "high-salience"
   let uptake choice-rate "high-salience" "reward"
-  let motivation-penalty min list 0 high-reward-crowding-out-effect
+  let motivation-penalty min list 0 (
+    mean-intrinsic-motivation "high-salience"
+    - mean-intrinsic-motivation "control")
   let policy-cost behaviorsearch-normalized-cost
 
   report durability
@@ -1209,227 +1332,132 @@ to-report behaviorsearch-fitness-no-crowding
 end
 ]]></code>
   <widgets>
-    <view x="455" wrappingAllowedX="false" y="15" frameRate="30.0" minPycor="-16" height="10" showTickCounter="false" patchSize="0.3" fontSize="10" wrappingAllowedY="false" width="10" tickCounterLabel="ticks" maxPycor="16" updateMode="0" maxPxcor="16" minPxcor="-16"></view>
-    <button x="90" y="15" height="40" disableUntilTicks="false" forever="true" kind="Observer" width="55">go</button>
-    <slider x="170" step="20" y="20" max="3000" display="number-of-shoppers" height="33" min="20" direction="Horizontal" default="1300.0" variable="number-of-shoppers" width="170" sizeVersion="0"></slider>
-    <plot x="985" autoPlotX="true" yMax="1.0" autoPlotY="false" y="15" xMin="0.0" height="185" legend="true" xMax="160.0" yMin="0.0" display="Mean Intrinsic Motivation" width="390" sizeVersion="0">
-      <setup></setup>
-      <update></update>
-      <pen interval="1.0" mode="0" display="Control" color="-15575016" legend="true">
-        <setup></setup>
-        <update>plotxy ticks mean [intrinsic-motivation] of shoppers with [
-    treatment-group = "control"
-]</update>
-      </pen>
-      <pen interval="1.0" mode="0" display="Low salience" color="-11221820" legend="true">
-        <setup></setup>
-        <update>plotxy ticks mean [intrinsic-motivation] of shoppers with [
-    treatment-group = "low-salience"
-]</update>
-      </pen>
-      <pen interval="1.0" mode="0" display="High salience" color="-2674135" legend="true">
-        <setup></setup>
-        <update>plotxy ticks mean [intrinsic-motivation] of shoppers with [
-    treatment-group = "high-salience"
-]</update>
-      </pen>
-    </plot>
-    <plot x="985" autoPlotX="true" yMax="1.0" autoPlotY="false" y="205" xMin="0.0" height="195" legend="true" xMax="160.0" yMin="0.0" display="Mean Habit Strength" width="390" sizeVersion="0">
-      <setup></setup>
-      <update></update>
-      <pen interval="1.0" mode="0" display="Control" color="-15575016" legend="true">
-        <setup></setup>
-        <update>plotxy ticks mean [habit] of shoppers with [
-    treatment-group = "control"
-]</update>
-      </pen>
-      <pen interval="1.0" mode="0" display="Low salience" color="-11221820" legend="true">
-        <setup></setup>
-        <update>plotxy ticks mean [habit] of shoppers with [
-    treatment-group = "low-salience"
-]</update>
-      </pen>
-      <pen interval="1.0" mode="0" display="High salience" color="-2674135" legend="true">
-        <setup></setup>
-        <update>plotxy ticks mean [habit] of shoppers with [
-    treatment-group = "high-salience"
-]</update>
-      </pen>
-    </plot>
-    <plot x="985" autoPlotX="true" yMax="0.5" autoPlotY="false" y="405" xMin="0.0" height="195" legend="true" xMax="160.0" yMin="-0.5" display="Intrinsic Motivation Gap vs Control" width="390" sizeVersion="0">
-      <setup></setup>
-      <update></update>
-      <pen interval="1.0" mode="0" display="Low salience - control" color="-11221820" legend="true">
-        <setup></setup>
-        <update>plotxy ticks (
-  mean [intrinsic-motivation] of shoppers with [treatment-group = "low-salience"]
-  - mean [intrinsic-motivation] of shoppers with [treatment-group = "control"]
-)</update>
-      </pen>
-      <pen interval="1.0" mode="0" display="High salience - control" color="-2674135" legend="true">
-        <setup></setup>
-        <update>plotxy ticks (
-  mean [intrinsic-motivation] of shoppers with [treatment-group = "high-salience"]
-  - mean [intrinsic-motivation] of shoppers with [treatment-group = "control"]
-)</update>
-      </pen>
-      <pen interval="1.0" mode="0" display="Zero reference" color="-7500403" legend="false">
-        <setup></setup>
-        <update>plotxy ticks 0</update>
-      </pen>
-    </plot>
-    <plot x="985" autoPlotX="true" yMax="1.0" autoPlotY="false" y="605" xMin="0.0" height="220" legend="true" xMax="160.0" yMin="-1.0" display="Mean Satisfaction" width="390" sizeVersion="0">
-      <setup></setup>
-      <update></update>
-      <pen interval="1.0" mode="0" display="Control" color="-10899396" legend="true">
-        <setup></setup>
-        <update>plot mean-satisfaction "control"</update>
-      </pen>
-      <pen interval="1.0" mode="0" display="Low salience" color="-11221820" legend="true">
-        <setup></setup>
-        <update>plot mean-satisfaction "low-salience"</update>
-      </pen>
-      <pen interval="1.0" mode="0" display="High salience" color="-2674135" legend="true">
-        <setup></setup>
-        <update>plot mean-satisfaction "high-salience"</update>
-      </pen>
-    </plot>
-    <slider x="25" step="0.05" y="395" max="1" display="acceptance-facilitation" height="33" min="0" direction="Horizontal" default="1.0" variable="acceptance-facilitation" width="190" sizeVersion="0"></slider>
-    <slider x="235" step="0.01" y="395" max="1" display="baseline-acceptance" height="33" min="0" direction="Horizontal" default="0.0" variable="baseline-acceptance" width="180" sizeVersion="0"></slider>
-    <slider x="235" step="0.05" y="475" max="2" display="confidence-bound" height="33" min="0.05" direction="Horizontal" default="0.2" variable="confidence-bound" width="180" sizeVersion="0"></slider>
-    <slider x="25" step="0.25" y="475" max="5" display="opinion-weight" height="33" min="0" direction="Horizontal" default="3.0" variable="opinion-weight" width="190" sizeVersion="0"></slider>
-    <slider x="25" step="0.005" y="435" max="0.2" display="opinion-mutation-rate" height="33" min="0" direction="Horizontal" default="0.01" variable="opinion-mutation-rate" width="190" sizeVersion="0"></slider>
-    <slider x="235" step="0.05" y="355" max="1" display="rewiring-probability" height="33" min="0" direction="Horizontal" default="0.2" variable="rewiring-probability" width="180" sizeVersion="0"></slider>
-    <chooser x="30" y="320" height="55" variable="network-topology" current="1" display="network-topology" width="190" sizeVersion="0">
+    <view x="440" wrappingAllowedX="false" y="10" frameRate="30.0" minPycor="-16" height="10" showTickCounter="false" patchSize="0.3" fontSize="10" wrappingAllowedY="false" width="10" tickCounterLabel="ticks" maxPycor="16" updateMode="0" maxPxcor="16" minPxcor="-16"></view>
+    <button x="10" y="10" height="35" disableUntilTicks="false" forever="false" kind="Observer" width="60">setup</button>
+    <button x="80" y="10" height="35" disableUntilTicks="false" forever="true" kind="Observer" width="60">go</button>
+    <monitor x="150" precision="17" y="10" height="45" fontSize="11" display="phase" width="130" sizeVersion="0">current-phase</monitor>
+    <monitor x="290" precision="0" y="10" height="45" fontSize="11" display="cycle" width="140" sizeVersion="0">current-cycle</monitor>
+    <note x="10" y="55" backgroundDark="603979776" fontSize="12" width="420" markdown="false" height="22" textColorDark="-1" textColorLight="-16777216" backgroundLight="603979776">PROGRAM</note>
+    <slider x="10" step="20" y="82" max="3000" display="number-of-shoppers" height="33" min="20" direction="Horizontal" default="1000.0" variable="number-of-shoppers" width="205" sizeVersion="0"></slider>
+    <slider x="225" step="1" y="82" max="6" display="reward-cycles" height="33" min="0" direction="Horizontal" default="6.0" variable="reward-cycles" width="205" sizeVersion="0"></slider>
+    <slider x="10" step="5" y="120" max="200" display="reward-duration" height="33" min="10" direction="Horizontal" default="60.0" variable="reward-duration" width="205" sizeVersion="0"></slider>
+    <slider x="225" step="5" y="120" max="200" display="withdrawal-duration" height="33" min="10" direction="Horizontal" default="60.0" variable="withdrawal-duration" width="205" sizeVersion="0"></slider>
+    <slider x="10" step="0.05" y="158" max="1" display="low-reward-salience" height="33" min="0" direction="Horizontal" default="0.15" variable="low-reward-salience" width="205" sizeVersion="0"></slider>
+    <slider x="225" step="0.05" y="158" max="1" display="high-reward-salience" height="33" min="0" direction="Horizontal" default="0.9" variable="high-reward-salience" width="205" sizeVersion="0"></slider>
+    <note x="10" y="200" backgroundDark="603979776" fontSize="12" width="420" markdown="false" height="22" textColorDark="-1" textColorLight="-16777216" backgroundLight="603979776">BEHAVIOR</note>
+    <slider x="10" step="0.25" y="227" max="8" display="choice-sharpness" height="33" min="0.25" direction="Horizontal" default="3.0" variable="choice-sharpness" width="205" sizeVersion="0"></slider>
+    <slider x="225" step="0.05" y="227" max="0" display="non-target-experience" height="33" min="-1" direction="Horizontal" default="-0.35" variable="non-target-experience" width="205" sizeVersion="0"></slider>
+    <note x="10" y="268" backgroundDark="603979776" fontSize="12" width="420" markdown="false" height="22" textColorDark="-1" textColorLight="-16777216" backgroundLight="603979776">TALK</note>
+    <switch x="10" y="295" height="33" on="true" variable="wom-on?" display="wom-on?" width="130" sizeVersion="0"></switch>
+    <slider x="150" step="0.25" y="295" max="5" display="opinion-weight" height="33" min="0" direction="Horizontal" default="2.0" variable="opinion-weight" width="130" sizeVersion="0"></slider>
+    <slider x="290" step="0.025" y="295" max="2" display="confidence-bound" height="33" min="0.025" direction="Horizontal" default="0.05" variable="confidence-bound" width="140" sizeVersion="0"></slider>
+    <slider x="10" step="0.01" y="333" max="0.8" display="opinion-memory-rate" height="33" min="0.01" direction="Horizontal" default="0.04" variable="opinion-memory-rate" width="205" sizeVersion="0"></slider>
+    <slider x="225" step="2" y="333" max="20" display="network-degree" height="33" min="2" direction="Horizontal" default="10.0" variable="network-degree" width="205" sizeVersion="0"></slider>
+    <chooser x="10" y="371" height="55" variable="network-topology" current="1" display="network-topology" width="205" sizeVersion="0">
       <choice type="string" value="small-world"></choice>
       <choice type="string" value="preferential-attachment"></choice>
       <choice type="string" value="ring-lattice"></choice>
       <choice type="string" value="random"></choice>
     </chooser>
-    <switch x="30" y="275" height="35" on="true" variable="wom-on?" display="wom-on?" width="130" sizeVersion="0"></switch>
-    <note x="30" y="80" backgroundDark="603979776" fontSize="12" width="150" markdown="false" height="25" textColorDark="-1" textColorLight="-16777216" backgroundLight="603979776">Loyalty program</note>
-    <slider x="30" step="1" y="110" max="6" display="reward-cycles" height="33" min="0" direction="Horizontal" default="6.0" variable="reward-cycles" width="125" sizeVersion="0"></slider>
-    <slider x="200" step="0.05" y="180" max="1" display="high-reward-salience" height="33" min="0" direction="Horizontal" default="0.9" variable="high-reward-salience" width="175" sizeVersion="0"></slider>
-    <slider x="30" step="0.05" y="180" max="1" display="low-reward-salience" height="33" min="0" direction="Horizontal" default="0.15" variable="low-reward-salience" width="165" sizeVersion="0"></slider>
-    <slider x="200" step="5" y="140" max="200" display="withdrawal-duration" height="33" min="10" direction="Horizontal" default="60.0" variable="withdrawal-duration" width="175" sizeVersion="0"></slider>
-    <slider x="30" step="5" y="145" max="200" display="reward-duration" height="33" min="10" direction="Horizontal" default="60.0" variable="reward-duration" width="140" sizeVersion="0"></slider>
-    <note x="30" y="245" backgroundDark="603979776" fontSize="12" width="240" markdown="false" height="25" textColorDark="-1" textColorLight="-16777216" backgroundLight="603979776">Social network and WOM</note>
-    <slider x="235" step="2" y="320" max="20" display="network-degree" height="33" min="2" direction="Horizontal" default="6.0" variable="network-degree" width="180" sizeVersion="0"></slider>
-    <monitor x="25" precision="17" y="525" height="45" fontSize="11" width="185" sizeVersion="0">current-phase</monitor>
-    <monitor x="25" precision="3" y="575" height="45" fontSize="11" width="185" sizeVersion="0">high-reward-crowding-out-effect</monitor>
-    <monitor x="235" precision="0" y="525" height="45" fontSize="11" display="current-cycle" width="180" sizeVersion="0">current-cycle</monitor>
-    <monitor x="25" precision="4" y="640" height="45" fontSize="11" display="Opinion range" width="105" sizeVersion="0">opinion-range</monitor>
-    <monitor x="275" precision="4" y="640" height="45" fontSize="11" display="StdDev Opinion" width="130" sizeVersion="0">standard-deviation [opinion] of shoppers</monitor>
-    <monitor x="140" precision="4" y="640" height="45" fontSize="11" display="Mean opinion" width="130" sizeVersion="0">mean [opinion] of shoppers</monitor>
-    <monitor x="25" precision="4" y="710" height="45" fontSize="11" display="Mean received-wom-count" width="170" sizeVersion="0">mean [received-wom-count] of shoppers</monitor>
-    <monitor x="200" precision="4" y="710" height="45" fontSize="11" display="Accepted-opinion receiver share" width="195" sizeVersion="0">wom-receiver-share</monitor>
-    <monitor x="200" precision="4" y="760" height="45" fontSize="11" display="Mean |WOM opinion change|" width="195" sizeVersion="0">mean-absolute-wom-opinion-change</monitor>
-    <monitor x="235" precision="3" y="575" height="45" fontSize="11" width="180" sizeVersion="0">low-reward-persistence-effect</monitor>
-    <plot x="455" autoPlotX="true" yMax="1.0" autoPlotY="false" y="15" xMin="0.0" height="350" legend="true" xMax="0.0" yMin="0.0" width="515" display="Target choice rate">
+    <chooser x="225" y="371" height="55" variable="initial-opinion-distribution" current="3" display="initial-opinion-distribution" width="205" sizeVersion="0">
+      <choice type="string" value="normal-around-0"></choice>
+      <choice type="string" value="uniform"></choice>
+      <choice type="string" value="bimodal"></choice>
+      <choice type="string" value="all-neutral"></choice>
+    </chooser>
+    <note x="10" y="434" backgroundDark="603979776" fontSize="12" width="420" markdown="false" height="22" textColorDark="-1" textColorLight="-16777216" backgroundLight="603979776">ADVANCED (leave alone unless sweeping)</note>
+    <slider x="10" step="0.05" y="461" max="1" display="rewiring-probability" height="33" min="0" direction="Horizontal" default="0.2" variable="rewiring-probability" width="205" sizeVersion="0"></slider>
+    <slider x="225" step="0.005" y="461" max="0.2" display="opinion-mutation-rate" height="33" min="0" direction="Horizontal" default="0.0" variable="opinion-mutation-rate" width="205" sizeVersion="0"></slider>
+    <slider x="10" step="0.05" y="499" max="1" display="acceptance-facilitation" height="33" min="0" direction="Horizontal" default="1.0" variable="acceptance-facilitation" width="205" sizeVersion="0"></slider>
+    <slider x="225" step="0.01" y="499" max="1" display="baseline-acceptance" height="33" min="0" direction="Horizontal" default="0.0" variable="baseline-acceptance" width="205" sizeVersion="0"></slider>
+    <switch x="10" y="537" height="33" on="true" variable="reward-affects-satisfaction?" display="reward-affects-satisfaction?" width="290" sizeVersion="0"></switch>
+    <monitor x="10" precision="3" y="585" height="45" fontSize="11" display="persistence index (high)" width="205" sizeVersion="0">persistence-index "high-salience"</monitor>
+    <monitor x="225" precision="3" y="585" height="45" fontSize="11" display="share locked in" width="205" sizeVersion="0">share-locked-in</monitor>
+    <monitor x="10" precision="3" y="635" height="45" fontSize="11" display="habit spread (SD)" width="205" sizeVersion="0">habit-standard-deviation</monitor>
+    <monitor x="225" precision="3" y="635" height="45" fontSize="11" display="mean intrinsic motivation (high)" width="205" sizeVersion="0">mean-intrinsic-motivation "high-salience"</monitor>
+    <note x="10" y="690" backgroundDark="603979776" fontSize="11" width="420" markdown="false" height="46" textColorDark="-1" textColorLight="-16777216" backgroundLight="603979776">Baseline = a separate run with reward-cycles 0. The control group inside a run hears treated neighbors, so it is not a baseline.</note>
+    <plot x="890" autoPlotX="true" yMax="1.0" autoPlotY="false" y="10" xMin="0.0" height="170" legend="true" xMax="160.0" yMin="0.0" display="Habit over time (p10-p90 gap = the split)" width="440" sizeVersion="0">
       <setup></setup>
       <update></update>
-      <pen interval="1.0" mode="0" display="Control" color="-15575016" legend="true">
+      <pen interval="1.0" mode="0" display="mean high" color="-2674135" legend="true">
         <setup></setup>
-        <update>plot count shoppers with [
-  treatment-group = "control" and chose-target?
-] / count shoppers with [
-  treatment-group = "control"
-]</update>
+        <update>plotxy ticks mean-habit "high-salience"</update>
       </pen>
-      <pen interval="1.0" mode="0" display="Low salience" color="-11221820" legend="true">
+      <pen interval="1.0" mode="0" display="mean control" color="-15575016" legend="true">
         <setup></setup>
-        <update>plot count shoppers with [
-  treatment-group = "low-salience" and chose-target?
-] / count shoppers with [
-  treatment-group = "low-salience"
-]</update>
+        <update>plotxy ticks mean-habit "control"</update>
       </pen>
-      <pen interval="1.0" mode="0" display="High salience" color="-2674135" legend="true">
+      <pen interval="1.0" mode="0" display="p90 all" color="-7500403" legend="true">
         <setup></setup>
-        <update>plot count shoppers with [
-  treatment-group = "high-salience" and chose-target?
-] / count shoppers with [
-  treatment-group = "high-salience"
-]</update>
+        <update>plotxy ticks habit-percentile 0.9</update>
+      </pen>
+      <pen interval="1.0" mode="0" display="p10 all" color="-7500403" legend="true">
+        <setup></setup>
+        <update>plotxy ticks habit-percentile 0.1</update>
       </pen>
     </plot>
-    <plot x="455" autoPlotX="false" yMax="100.0" autoPlotY="true" y="375" xMin="-1.0" height="165" legend="false" xMax="1.0" yMin="0.0" width="515" display="Opinion distribution">
-      <setup>clear-plot
-set-plot-x-range -1 1
-set-histogram-num-bars 40</setup>
+    <note x="890" y="182" backgroundDark="603979776" fontSize="11" width="440" markdown="false" height="35" textColorDark="-1" textColorLight="-16777216" backgroundLight="603979776">habit = share of target choices in a shopper's last 20 purchases (0 = never, 1 = always). A wide p10-p90 gap means the population has split.</note>
+    <plot x="895" autoPlotX="false" yMax="10.0" autoPlotY="true" y="220" xMin="0.0" height="170" legend="true" xMax="1.0" yMin="0.0" display="Habit distribution (two humps = lock-in)" width="440" sizeVersion="0">
+      <setup>set-plot-x-range 0 1</setup>
       <update></update>
-      <pen interval="0.05" mode="1" display="Opinion" color="-16777216" legend="false">
+      <pen interval="0.025" mode="1" display="habit" color="-13345367" legend="true">
         <setup></setup>
-        <update>clear-plot
-set-plot-x-range -1 1
+        <update>plot-pen-reset
+set-histogram-num-bars 40
+histogram [habit] of shoppers</update>
+      </pen>
+    </plot>
+    <plot x="895" autoPlotX="false" yMax="1.0" autoPlotY="false" y="564" xMin="0.0" height="142" legend="true" xMax="1.0" yMin="-1.0" display="Habit vs opinion (two clouds = rival groups)" width="440" sizeVersion="0">
+      <setup>set-plot-x-range 0 1
+set-plot-y-range -1 1</setup>
+      <update></update>
+      <pen interval="1.0" mode="2" display="shoppers" color="-8630108" legend="true">
+        <setup></setup>
+        <update>plot-pen-reset
+ask shoppers [ plotxy habit opinion ]</update>
+      </pen>
+    </plot>
+    <plot x="895" autoPlotX="false" yMax="10.0" autoPlotY="true" y="392" xMin="-1.0" height="170" legend="true" xMax="1.0" yMin="0.0" display="Opinion distribution (two humps = rival camps)" width="440" sizeVersion="0">
+      <setup>set-plot-x-range -1 1</setup>
+      <update></update>
+      <pen interval="0.05" mode="1" display="opinion" color="-955883" legend="true">
+        <setup></setup>
+        <update>plot-pen-reset
 set-histogram-num-bars 40
 histogram [opinion] of shoppers</update>
       </pen>
     </plot>
-    <plot x="1385" autoPlotX="true" yMax="0.5" autoPlotY="false" y="205" xMin="0.0" height="190" legend="true" xMax="160.0" yMin="0.0" display="Persistence Index" width="390" sizeVersion="0">
+    <note x="895" y="708" backgroundDark="603979776" fontSize="11" width="440" markdown="false" height="35" textColorDark="-1" textColorLight="-16777216" backgroundLight="603979776">Each dot is one shopper: x = habit, y = opinion. Two separated clouds mean a loyal camp coexists with a disloyal one.</note>
+    <plot x="440" autoPlotX="true" yMax="1.0" autoPlotY="false" y="10" xMin="0.0" height="340" legend="true" xMax="160.0" yMin="0.0" display="Target choice rate" width="440" sizeVersion="0">
       <setup></setup>
       <update></update>
-      <pen interval="1.0" mode="0" display="Control" color="-15575016" legend="true">
+      <pen interval="1.0" mode="0" display="control" color="-15575016" legend="true">
         <setup></setup>
-        <update><![CDATA[if final-withdrawal-ticks-completed > 0 [ plotxy ticks persistence-index "control" ]]]></update>
+        <update>plotxy ticks current-choice-rate "control"</update>
       </pen>
-      <pen interval="1.0" mode="0" display="Low salience" color="-11221820" legend="true">
+      <pen interval="1.0" mode="0" display="low" color="-11221820" legend="true">
         <setup></setup>
-        <update><![CDATA[if final-withdrawal-ticks-completed > 0 [ plotxy ticks persistence-index "low-salience" ]]]></update>
+        <update>plotxy ticks current-choice-rate "low-salience"</update>
       </pen>
-      <pen interval="1.0" mode="0" display="High salience" color="-2674135" legend="true">
+      <pen interval="1.0" mode="0" display="high" color="-2674135" legend="true">
         <setup></setup>
-        <update><![CDATA[if final-withdrawal-ticks-completed > 0 [ plotxy ticks persistence-index "high-salience" ]]]></update>
-      </pen>
-      <pen interval="1.0" mode="0" display="Zero reference" color="-7500403" legend="false">
-        <setup></setup>
-        <update><![CDATA[if final-withdrawal-ticks-completed > 0 [ plotxy ticks 0 ]]]></update>
+        <update>plotxy ticks current-choice-rate "high-salience"</update>
       </pen>
     </plot>
-    <plot x="1385" autoPlotX="true" yMax="0.75" autoPlotY="false" y="15" xMin="0.0" height="185" legend="true" xMax="160.0" yMin="0.25" display="Persistence after reward withdrawal" width="390" sizeVersion="0">
+    <plot x="440" autoPlotX="true" yMax="1.0" autoPlotY="false" y="365" xMin="0.0" height="340" legend="true" xMax="160.0" yMin="-1.0" display="Memory wedge: satisfaction vs opinion (high)" width="440" sizeVersion="0">
       <setup></setup>
       <update></update>
-      <pen interval="1.0" mode="0" display="Control" color="-15575016" legend="true">
+      <pen interval="1.0" mode="0" display="satisfaction" color="-2674135" legend="true">
         <setup></setup>
-        <update><![CDATA[if final-withdrawal-ticks-completed > 0 [ plotxy ticks persistence "control" ]]]></update>
+        <update>plotxy ticks mean-satisfaction "high-salience"</update>
       </pen>
-      <pen interval="1.0" mode="0" display="Low salience" color="-11221820" legend="true">
+      <pen interval="1.0" mode="0" display="opinion" color="-13345367" legend="true">
         <setup></setup>
-        <update><![CDATA[if final-withdrawal-ticks-completed > 0 [ plotxy ticks persistence "low-salience" ]]]></update>
-      </pen>
-      <pen interval="1.0" mode="0" display="High salience" color="-2674135" legend="true">
-        <setup></setup>
-        <update><![CDATA[if final-withdrawal-ticks-completed > 0 [ plotxy ticks persistence "high-salience" ]]]></update>
+        <update>plotxy ticks mean-opinion "high-salience"</update>
       </pen>
     </plot>
-    <plot x="1385" autoPlotX="true" yMax="1.0" autoPlotY="false" y="605" xMin="0.0" height="220" legend="true" xMax="160.0" yMin="-1.0" display="Mean Opinion" width="390" sizeVersion="0">
-      <setup></setup>
-      <update></update>
-      <pen interval="1.0" mode="0" display="Control" color="-10899396" legend="true">
-        <setup></setup>
-        <update>plot mean-opinion "control"</update>
-      </pen>
-      <pen interval="1.0" mode="0" display="Low salience" color="-11221820" legend="true">
-        <setup></setup>
-        <update>plot mean-opinion "low-salience"</update>
-      </pen>
-      <pen interval="1.0" mode="0" display="High salience" color="-2674135" legend="true">
-        <setup></setup>
-        <update>plot mean-opinion "high-salience"</update>
-      </pen>
-    </plot>
-    <note x="625" y="565" backgroundDark="603979776" fontSize="12" width="220" markdown="false" height="30" textColorDark="-1" textColorLight="-16777216" backgroundLight="603979776">Persistence (final withdrawal)</note>
-    <monitor x="785" precision="3" y="715" height="45" fontSize="11" display="High Salience" width="100" sizeVersion="0">persistence-index "high-salience"</monitor>
-    <monitor x="675" precision="3" y="715" height="45" fontSize="11" display="Low Salience" width="100" sizeVersion="0">persistence-index "low-salience"</monitor>
-    <monitor x="560" precision="3" y="715" height="45" fontSize="11" display="Control" width="105" sizeVersion="0">persistence-index "control"</monitor>
-    <note x="620" y="680" backgroundDark="603979776" fontSize="12" width="230" markdown="false" height="30" textColorDark="-1" textColorLight="-16777216" backgroundLight="603979776">Persistence Index (post − baseline)</note>
-    <monitor x="780" precision="3" y="600" height="45" fontSize="11" display="High Salience" width="100" sizeVersion="0">persistence "high-salience"</monitor>
-    <monitor x="670" precision="3" y="600" height="45" fontSize="11" display="Low Salience" width="100" sizeVersion="0">persistence "low-salience"</monitor>
-    <monitor x="555" precision="3" y="600" height="45" fontSize="11" display="Control" width="105" sizeVersion="0">persistence "control"</monitor>
-    <button x="30" y="15" height="40" disableUntilTicks="false" forever="false" kind="Observer" width="55">setup</button>
-    <switch x="235" y="430" height="35" on="false" variable="hk-validation-mode?" display="hk-validation-mode?" width="175" sizeVersion="0"></switch>
   </widgets>
-  <info># Агентна модель програм лояльності, satisfaction, opinion і WOM
+  <info><![CDATA[# Агентна модель програм лояльності, satisfaction, opinion і WOM
 
 ## Призначення
 
@@ -1611,27 +1639,124 @@ All experiments use 30 repetitions per configuration and record behavior, motiva
 `confidence-bound` задає максимальну допустиму різницю між поточним opinion покупця та отриманою рекомендацією. Повідомлення поза цією межею ігноруються. `social-susceptibility` визначає силу зміни opinion уже після прийняття повідомлення.
 
 
-## HK validation mode
+## Decision structure with and without the network mechanism
 
-Enable `hk-validation-mode?` to validate the bounded-confidence opinion
-dynamics separately from the loyalty-program mechanisms.
+**WOM OFF**
 
-In this mode:
+`price + intrinsic motivation + habit + reward -> target choice`
 
-- initial opinions are uniformly distributed on [-1, 1];
-- purchase, satisfaction, habit, motivation and target choice are frozen;
-- every shopper considers the whole population rather than only network neighbors;
-- opinions are updated synchronously;
-- the Opinion distribution histogram shows consensus or clustering.
+Opinion does not enter the decision utility and is not updated from satisfaction.
 
-Recommended starting settings:
+**WOM ON**
 
-- `number-of-shoppers = 300`;
-- `confidence-bound = 0.20–0.35`;
-- `acceptance-facilitation = 1`;
-- `baseline-acceptance = 0`;
-- `opinion-mutation-rate = 0`.
-</info>
+`satisfaction -> individual opinion -> probabilistic bounded-confidence network update`
+
+Then:
+
+`price + intrinsic motivation + habit + reward + opinion -> target choice`
+
+The network mechanism is an adaptation of the opinion dynamics used in
+`codbc_m_eps_f_beta`: opinions are read from the previous synchronous state,
+neighbors are accepted probabilistically according to opinion discrepancy,
+and the new opinion is the mean of the agent's own opinion and accepted
+neighbor opinions.
+
+
+---
+
+# v13.2 addendum: the current model (read this first)
+
+Everything above this line describes v12 and, in places, a model that
+was never implemented. It is kept for traceability. Where the two
+disagree, this section is correct.
+
+## What v13.2 is
+
+v12 could not show lock-in, network memory, or rival loyalty groups at
+any parameter setting. Five switches fix that, each defaulting to a
+working value and each able to reproduce v12 when set back:
+
+* choice-sharpness (default 3.0; v12 = 1.0). Multiplies the utility
+  before the logistic. Above roughly 2.5 the choice-habit feedback can
+  sustain itself, which is what lock-in means.
+* opinion-memory-rate (default 0.04; v12 = 0.25). Speed at which own
+  experience rewrites opinion. Low = opinion is a slow memory store.
+* non-target-experience (default -0.35; v12 = -0.05). How negative a
+  non-target purchase feels. Creates a genuine detractor pole.
+* confidence-bound (default 0.05; v12 widget = 0.1). Narrow bounds let
+  opinion camps coexist; wide bounds average everyone together and
+  word of mouth then erases the very effects being studied.
+* reward-affects-satisfaction? (default on). Off removes the
+  undocumented second reward path through satisfaction and opinion.
+
+A chooser, initial-opinion-distribution, sets the starting shape of
+opinion: normal-around-0 (default, reproduces earlier behaviour),
+uniform, bimodal (half mildly for, half mildly against), or
+all-neutral. It only affects setup; the dynamics are unchanged.
+
+opinion-mutation-rate now defaults to 0. At the old 0.065, 6.5 percent
+of shoppers had their opinion replaced by a random draw every tick,
+wiping the memory the model studies. opinion-weight defaults to 2.0,
+provisional until E6 pins it.
+
+Treatment is assigned after the network is built, from a shuffled
+list, so group membership is independent of network position (v12 used
+`who mod 3`, which locked the two together). The display jitter that
+consumed random numbers in headless runs is gone. `behaviorsearch-
+fitness` now measures intrinsic motivation. A local variable named
+`position` shadowed a NetLogo primitive and is now `slot-index`.
+
+## The interface
+
+Six plots, one question each. Target choice rate: what the programme
+did. Habit over time: mean habit for the treated and control groups
+with a p10-p90 band across all shoppers; a wide gap means the
+population has split (habit itself is the share of target choices in
+the shopper's last 20 purchases). Habit distribution and Opinion
+distribution, 40 bins each: two humps mean two groups. Habit vs
+opinion: each dot is one shopper; two separated clouds = a locked-in
+loyal camp coexisting with a locked-out one. Memory wedge:
+satisfaction collapses within a tick or two of cancellation; opinion
+staying high after it is the network memory. Notes under the plots
+repeat these readings. Four monitors: persistence index, share locked
+in, habit spread, mean intrinsic motivation.
+
+Both histograms re-apply set-histogram-num-bars after plot-pen-reset,
+and declare a matching default interval. plot-pen-reset restores a
+pen's default interval, and set-histogram-num-bars works by setting
+that interval, so calling them in the wrong order silently reverts the
+bar count to one bar per unit: two bars over the opinion range and one
+over the habit range. Auto-scaling of the x axis is off on both, so the
+ranges stay fixed at 0 to 1 and -1 to 1.
+
+The baseline is a separate run with reward-cycles = 0. The control
+group inside a treated run hears its treated neighbours through the
+shared network, so it is not a baseline; the shared network is a
+deliberate design choice, and this is its price.
+
+## Experiments
+
+All ten seed the generator and pin every parameter. regression-test
+reproduces v12 exactly (all pins at v12 values, fixed seed);
+regression-test-v13-1 does the same for the current defaults. E1-E4
+sweep reward-affects-satisfaction? both ways, separating the direct
+reward effect from the indirect one for the first time. E7 sweeps
+sharpness, bound, experience scale and memory rate to map where the
+three effects live. E8 crosses reward-cycles {0,1} with wom-on?
+{false,true}: the no-programme arm is the clean baseline, and the 2x2
+answers amplification versus substitution directly.
+
+## Known limits
+
+Control shoppers receive no motivational update, so motivation
+comparisons against control are one-sided. Phase choice rates assume a
+closed, fixed-size population. The four constants in
+initialize-constants (baseline-duration, habit-memory-window,
+salience-threshold, target-choice-cost) still cannot be swept. There
+is no money anywhere in the model: no spend, margin, campaign cost, or
+lifetime value. None of these blocks Experiment 2.1; the last one
+blocks 2.2, 2.3, 4.1 and 4.2.
+]]></info>
   <turtleShapes>
     <shape name="default" rotatable="true" editableColorIndex="0">
       <polygon color="-1920102913" filled="true" marked="true">
@@ -2515,13 +2640,44 @@ setup</setup>
         <enumeratedValueSet variable="opinion-mutation-rate">
           <value value="0"></value>
         </enumeratedValueSet>
-        <enumeratedValueSet variable="hk-validation-mode?">
-          <value value="false"></value>
+        <enumeratedValueSet variable="choice-sharpness">
+          <value value="1"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="opinion-memory-rate">
+          <value value="0.25"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="non-target-experience">
+          <value value="-0.05"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="reward-affects-satisfaction?">
+          <value value="true"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="wom-on?">
+          <value value="true"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="network-topology">
+          <value value="&quot;preferential-attachment&quot;"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="network-degree">
+          <value value="10"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="rewiring-probability">
+          <value value="0.2"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="confidence-bound">
+          <value value="0.1"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="opinion-weight">
+          <value value="3"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="initial-opinion-distribution">
+          <value value="&quot;normal-around-0&quot;"></value>
         </enumeratedValueSet>
       </constants>
     </experiment>
     <experiment name="E1 reward magnitude and crowding-out" repetitions="30" sequentialRunOrder="true" runMetricsEveryStep="false">
-      <setup>setup</setup>
+      <setup>random-seed behaviorspace-run-number
+setup</setup>
       <go>go</go>
       <exitCondition>simulation-finished?</exitCondition>
       <metrics>
@@ -2584,13 +2740,45 @@ setup</setup>
         <enumeratedValueSet variable="opinion-mutation-rate">
           <value value="0"></value>
         </enumeratedValueSet>
-        <enumeratedValueSet variable="hk-validation-mode?">
+        <enumeratedValueSet variable="choice-sharpness">
+          <value value="1"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="opinion-memory-rate">
+          <value value="0.25"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="non-target-experience">
+          <value value="-0.05"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="reward-affects-satisfaction?">
+          <value value="true"></value>
           <value value="false"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="wom-on?">
+          <value value="true"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="network-topology">
+          <value value="&quot;preferential-attachment&quot;"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="network-degree">
+          <value value="10"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="rewiring-probability">
+          <value value="0.2"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="confidence-bound">
+          <value value="0.1"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="opinion-weight">
+          <value value="3"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="initial-opinion-distribution">
+          <value value="&quot;normal-around-0&quot;"></value>
         </enumeratedValueSet>
       </constants>
     </experiment>
     <experiment name="E2 reward magnitude x duration" repetitions="30" sequentialRunOrder="true" runMetricsEveryStep="false">
-      <setup>setup</setup>
+      <setup>random-seed behaviorspace-run-number
+setup</setup>
       <go>go</go>
       <exitCondition>simulation-finished?</exitCondition>
       <metrics>
@@ -2655,13 +2843,45 @@ setup</setup>
         <enumeratedValueSet variable="opinion-mutation-rate">
           <value value="0"></value>
         </enumeratedValueSet>
-        <enumeratedValueSet variable="hk-validation-mode?">
+        <enumeratedValueSet variable="choice-sharpness">
+          <value value="1"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="opinion-memory-rate">
+          <value value="0.25"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="non-target-experience">
+          <value value="-0.05"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="reward-affects-satisfaction?">
+          <value value="true"></value>
           <value value="false"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="wom-on?">
+          <value value="true"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="network-topology">
+          <value value="&quot;preferential-attachment&quot;"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="network-degree">
+          <value value="10"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="rewiring-probability">
+          <value value="0.2"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="confidence-bound">
+          <value value="0.1"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="opinion-weight">
+          <value value="3"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="initial-opinion-distribution">
+          <value value="&quot;normal-around-0&quot;"></value>
         </enumeratedValueSet>
       </constants>
     </experiment>
     <experiment name="E3 repeated campaign structure" repetitions="30" sequentialRunOrder="true" runMetricsEveryStep="false">
-      <setup>setup</setup>
+      <setup>random-seed behaviorspace-run-number
+setup</setup>
       <go>go</go>
       <exitCondition>simulation-finished?</exitCondition>
       <metrics>
@@ -2726,13 +2946,45 @@ setup</setup>
         <enumeratedValueSet variable="opinion-mutation-rate">
           <value value="0"></value>
         </enumeratedValueSet>
-        <enumeratedValueSet variable="hk-validation-mode?">
+        <enumeratedValueSet variable="choice-sharpness">
+          <value value="1"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="opinion-memory-rate">
+          <value value="0.25"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="non-target-experience">
+          <value value="-0.05"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="reward-affects-satisfaction?">
+          <value value="true"></value>
           <value value="false"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="wom-on?">
+          <value value="true"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="network-topology">
+          <value value="&quot;preferential-attachment&quot;"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="network-degree">
+          <value value="10"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="rewiring-probability">
+          <value value="0.2"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="confidence-bound">
+          <value value="0.1"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="opinion-weight">
+          <value value="3"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="initial-opinion-distribution">
+          <value value="&quot;normal-around-0&quot;"></value>
         </enumeratedValueSet>
       </constants>
     </experiment>
     <experiment name="E4 statistical forecasting benchmark" repetitions="30" sequentialRunOrder="true" runMetricsEveryStep="true">
-      <setup>setup</setup>
+      <setup>random-seed behaviorspace-run-number
+setup</setup>
       <go>go</go>
       <exitCondition>simulation-finished?</exitCondition>
       <metrics>
@@ -2778,13 +3030,45 @@ setup</setup>
         <enumeratedValueSet variable="opinion-mutation-rate">
           <value value="0"></value>
         </enumeratedValueSet>
-        <enumeratedValueSet variable="hk-validation-mode?">
+        <enumeratedValueSet variable="choice-sharpness">
+          <value value="1"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="opinion-memory-rate">
+          <value value="0.25"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="non-target-experience">
+          <value value="-0.05"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="reward-affects-satisfaction?">
+          <value value="true"></value>
           <value value="false"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="wom-on?">
+          <value value="true"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="network-topology">
+          <value value="&quot;preferential-attachment&quot;"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="network-degree">
+          <value value="10"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="rewiring-probability">
+          <value value="0.2"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="confidence-bound">
+          <value value="0.1"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="opinion-weight">
+          <value value="3"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="initial-opinion-distribution">
+          <value value="&quot;normal-around-0&quot;"></value>
         </enumeratedValueSet>
       </constants>
     </experiment>
     <experiment name="E5 WOM withdrawal compensation calibration" repetitions="30" sequentialRunOrder="true" runMetricsEveryStep="false">
-      <setup>setup</setup>
+      <setup>random-seed behaviorspace-run-number
+setup</setup>
       <go>go</go>
       <exitCondition>simulation-finished?</exitCondition>
       <metrics>
@@ -2797,7 +3081,6 @@ setup</setup>
         <metric>mean-intrinsic-motivation "high-salience"</metric>
         <metric>mean-habit "high-salience"</metric>
         <metric>mean-opinion "high-salience"</metric>
-        <metric>wom-speaker-share</metric>
         <metric>wom-receiver-share</metric>
         <metric>mean-absolute-wom-opinion-change</metric>
         <metric>mean-network-degree</metric>
@@ -2840,17 +3123,10 @@ setup</setup>
         <enumeratedValueSet variable="rewiring-probability">
           <value value="0.1"></value>
         </enumeratedValueSet>
-        <enumeratedValueSet variable="purchase-deliberation-mode">
-          <value value="&quot;low-involvement&quot;"></value>
-          <value value="&quot;high-involvement&quot;"></value>
-        </enumeratedValueSet>
         <enumeratedValueSet variable="confidence-bound">
           <value value="0.3"></value>
           <value value="0.6"></value>
           <value value="1"></value>
-        </enumeratedValueSet>
-        <enumeratedValueSet variable="show-network?">
-          <value value="false"></value>
         </enumeratedValueSet>
         <enumeratedValueSet variable="acceptance-facilitation">
           <value value="1"></value>
@@ -2861,13 +3137,29 @@ setup</setup>
         <enumeratedValueSet variable="opinion-mutation-rate">
           <value value="0"></value>
         </enumeratedValueSet>
-        <enumeratedValueSet variable="hk-validation-mode?">
-          <value value="false"></value>
+        <enumeratedValueSet variable="choice-sharpness">
+          <value value="1"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="opinion-memory-rate">
+          <value value="0.25"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="non-target-experience">
+          <value value="-0.05"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="reward-affects-satisfaction?">
+          <value value="true"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="opinion-weight">
+          <value value="2"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="initial-opinion-distribution">
+          <value value="&quot;normal-around-0&quot;"></value>
         </enumeratedValueSet>
       </constants>
     </experiment>
     <experiment name="E6 opinion-weight" repetitions="30" sequentialRunOrder="true" runMetricsEveryStep="false">
-      <setup>setup</setup>
+      <setup>random-seed behaviorspace-run-number
+setup</setup>
       <go>go</go>
       <exitCondition>simulation-finished?</exitCondition>
       <metrics>
@@ -2880,7 +3172,6 @@ setup</setup>
         <metric>mean-intrinsic-motivation "high-salience"</metric>
         <metric>mean-habit "high-salience"</metric>
         <metric>mean-opinion "high-salience"</metric>
-        <metric>wom-speaker-share</metric>
         <metric>wom-receiver-share</metric>
         <metric>mean-absolute-wom-opinion-change</metric>
         <metric>mean-network-degree</metric>
@@ -2918,19 +3209,12 @@ setup</setup>
         <enumeratedValueSet variable="rewiring-probability">
           <value value="0.15"></value>
         </enumeratedValueSet>
-        <enumeratedValueSet variable="purchase-deliberation-mode">
-          <value value="&quot;low-involvement&quot;"></value>
-          <value value="&quot;high-involvement&quot;"></value>
-        </enumeratedValueSet>
         <enumeratedValueSet variable="confidence-bound">
           <value value="0.25"></value>
           <value value="0.5"></value>
           <value value="0.75"></value>
           <value value="0.9"></value>
           <value value="1"></value>
-        </enumeratedValueSet>
-        <enumeratedValueSet variable="show-network?">
-          <value value="false"></value>
         </enumeratedValueSet>
         <enumeratedValueSet variable="opinion-weight">
           <value value="0"></value>
@@ -2952,8 +3236,275 @@ setup</setup>
         <enumeratedValueSet variable="opinion-mutation-rate">
           <value value="0"></value>
         </enumeratedValueSet>
-        <enumeratedValueSet variable="hk-validation-mode?">
+        <enumeratedValueSet variable="choice-sharpness">
+          <value value="1"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="opinion-memory-rate">
+          <value value="0.25"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="non-target-experience">
+          <value value="-0.05"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="reward-affects-satisfaction?">
+          <value value="true"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="initial-opinion-distribution">
+          <value value="&quot;normal-around-0&quot;"></value>
+        </enumeratedValueSet>
+      </constants>
+    </experiment>
+    <experiment name="E7 v13 do the three effects appear" repetitions="5" sequentialRunOrder="true" runMetricsEveryStep="true">
+      <setup>random-seed behaviorspace-run-number
+setup</setup>
+      <go>go</go>
+      <exitCondition>simulation-finished?</exitCondition>
+      <metrics>
+        <metric>current-choice-rate "high-salience"</metric>
+        <metric>share-locked-in</metric>
+        <metric>share-locked-out</metric>
+        <metric>habit-standard-deviation</metric>
+        <metric>mean-habit "high-salience"</metric>
+        <metric>mean-opinion "high-salience"</metric>
+        <metric>opinion-standard-deviation</metric>
+        <metric>opinion-range</metric>
+        <metric>mean-intrinsic-motivation "high-salience"</metric>
+        <metric>persistence-index "high-salience"</metric>
+      </metrics>
+      <constants>
+        <enumeratedValueSet variable="number-of-shoppers">
+          <value value="800"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="reward-cycles">
+          <value value="1"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="reward-duration">
+          <value value="60"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="withdrawal-duration">
+          <value value="80"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="low-reward-salience">
+          <value value="0.15"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="high-reward-salience">
+          <value value="0.75"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="wom-on?">
           <value value="false"></value>
+          <value value="true"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="network-topology">
+          <value value="&quot;small-world&quot;"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="network-degree">
+          <value value="8"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="rewiring-probability">
+          <value value="0.1"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="confidence-bound">
+          <value value="0.025"></value>
+          <value value="0.05"></value>
+          <value value="0.1"></value>
+          <value value="0.2"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="acceptance-facilitation">
+          <value value="1"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="baseline-acceptance">
+          <value value="0"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="opinion-mutation-rate">
+          <value value="0"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="opinion-weight">
+          <value value="2"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="choice-sharpness">
+          <value value="1"></value>
+          <value value="2"></value>
+          <value value="3"></value>
+          <value value="4"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="opinion-memory-rate">
+          <value value="0.25"></value>
+          <value value="0.04"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="non-target-experience">
+          <value value="-0.05"></value>
+          <value value="-0.35"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="reward-affects-satisfaction?">
+          <value value="true"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="initial-opinion-distribution">
+          <value value="&quot;normal-around-0&quot;"></value>
+        </enumeratedValueSet>
+      </constants>
+    </experiment>
+    <experiment name="E8 program vs no-program baseline" repetitions="20" sequentialRunOrder="true" runMetricsEveryStep="false">
+      <setup>random-seed behaviorspace-run-number
+setup</setup>
+      <go>go</go>
+      <exitCondition>simulation-finished?</exitCondition>
+      <metrics>
+        <metric>choice-rate "high-salience" "baseline"</metric>
+        <metric>final-withdrawal-choice-rate "high-salience"</metric>
+        <metric>final-withdrawal-choice-rate "control"</metric>
+        <metric>persistence-index "high-salience"</metric>
+        <metric>persistence-index "control"</metric>
+        <metric>share-locked-in</metric>
+        <metric>share-locked-out</metric>
+        <metric>habit-standard-deviation</metric>
+        <metric>mean-opinion "high-salience"</metric>
+        <metric>mean-opinion "control"</metric>
+        <metric>opinion-standard-deviation</metric>
+      </metrics>
+      <constants>
+        <enumeratedValueSet variable="number-of-shoppers">
+          <value value="1000"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="reward-cycles">
+          <value value="0"></value>
+          <value value="1"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="reward-duration">
+          <value value="60"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="withdrawal-duration">
+          <value value="80"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="low-reward-salience">
+          <value value="0.15"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="high-reward-salience">
+          <value value="0.75"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="wom-on?">
+          <value value="false"></value>
+          <value value="true"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="network-topology">
+          <value value="&quot;small-world&quot;"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="network-degree">
+          <value value="8"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="rewiring-probability">
+          <value value="0.1"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="confidence-bound">
+          <value value="0.05"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="acceptance-facilitation">
+          <value value="1"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="baseline-acceptance">
+          <value value="0"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="opinion-mutation-rate">
+          <value value="0"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="opinion-weight">
+          <value value="2"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="choice-sharpness">
+          <value value="3"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="opinion-memory-rate">
+          <value value="0.04"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="non-target-experience">
+          <value value="-0.35"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="reward-affects-satisfaction?">
+          <value value="true"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="initial-opinion-distribution">
+          <value value="&quot;normal-around-0&quot;"></value>
+        </enumeratedValueSet>
+      </constants>
+    </experiment>
+    <experiment name="regression-test-v13-1" repetitions="1" sequentialRunOrder="true" runMetricsEveryStep="false">
+      <setup>random-seed 12345
+setup</setup>
+      <go>go</go>
+      <exitCondition><![CDATA[ticks >= experiment-end]]></exitCondition>
+      <metrics>
+        <metric>high-reward-crowding-out-effect</metric>
+        <metric>low-reward-persistence-effect</metric>
+        <metric>final-withdrawal-choice-rate "control"</metric>
+        <metric>final-withdrawal-choice-rate "low-salience"</metric>
+        <metric>final-withdrawal-choice-rate "high-salience"</metric>
+        <metric>mean-intrinsic-motivation "high-salience"</metric>
+        <metric>mean-habit "high-salience"</metric>
+        <metric>persistence "control"</metric>
+        <metric>persistence "low-salience"</metric>
+        <metric>persistence "high-salience"</metric>
+        <metric>persistence-index "control"</metric>
+        <metric>persistence-index "low-salience"</metric>
+        <metric>persistence-index "high-salience"</metric>
+      </metrics>
+      <constants>
+        <enumeratedValueSet variable="number-of-shoppers">
+          <value value="1000"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="reward-cycles">
+          <value value="1"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="reward-duration">
+          <value value="60"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="withdrawal-duration">
+          <value value="60"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="low-reward-salience">
+          <value value="0.15"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="high-reward-salience">
+          <value value="0.9"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="wom-on?">
+          <value value="true"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="network-topology">
+          <value value="&quot;preferential-attachment&quot;"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="network-degree">
+          <value value="10"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="rewiring-probability">
+          <value value="0.2"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="acceptance-facilitation">
+          <value value="1"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="baseline-acceptance">
+          <value value="0"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="opinion-mutation-rate">
+          <value value="0"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="opinion-weight">
+          <value value="2"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="confidence-bound">
+          <value value="0.05"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="choice-sharpness">
+          <value value="3"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="opinion-memory-rate">
+          <value value="0.04"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="non-target-experience">
+          <value value="-0.35"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="reward-affects-satisfaction?">
+          <value value="true"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="initial-opinion-distribution">
+          <value value="&quot;normal-around-0&quot;"></value>
         </enumeratedValueSet>
       </constants>
     </experiment>

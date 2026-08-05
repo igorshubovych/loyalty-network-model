@@ -180,7 +180,7 @@ shoppers-own [
 ;; =========================================================
 
 to initialize-constants
-  set baseline-duration 30
+  set baseline-duration 10000
   set habit-memory-window 20
   set salience-threshold 0.60
   set target-choice-cost 1.50
@@ -312,7 +312,8 @@ to initialize-shopper-state
   ;; невеликий випадковий розкид. Надалі satisfaction замінюється
   ;; після кожної покупки, тоді як opinion накопичує досвід.
   set satisfaction bounded-random-normal 0 0.10 -1 1
-  set opinion bounded-random-normal 0 0.15 -1 1
+  ;set opinion bounded-random-normal 0 0.15 -1 1
+  set opinion bounded-random 1 -1 1
   set opinion-update-rate bounded-random-normal 0.25 0.1 0.05 0.80
 
   set previous-opinion opinion
@@ -1157,6 +1158,15 @@ to-report bounded-random-normal
     maximum
 end
 
+to-report bounded-random
+  [mean-value minimum maximum]
+
+  report clamp
+    (random-float 2 * mean-value - mean-value)
+    minimum
+    maximum
+end
+
 
 ;; =========================================================
 ;; BEHAVIORSEARCH FITNESS REPORTERS
@@ -1230,7 +1240,6 @@ end
 ]</update>
       </pen>
     </plot>
-    <note x="30" y="80" backgroundDark="603979776" fontSize="12" width="150" markdown="false" height="25" textColorDark="-1" textColorLight="-16777216" backgroundLight="603979776">Loyalty program</note>
     <plot x="455" autoPlotX="true" yMax="1.0" autoPlotY="false" y="15" xMin="0.0" height="445" legend="true" xMax="0.0" yMin="0.0" width="515" display="Target choice rate">
       <setup></setup>
       <update></update>
@@ -1275,7 +1284,6 @@ end
         <update><![CDATA[if final-withdrawal-ticks-completed > 0 [ plotxy ticks persistence "high-salience" ]]]></update>
       </pen>
     </plot>
-    <button x="30" y="15" height="40" disableUntilTicks="false" forever="false" kind="Observer" width="55">setup</button>
     <plot x="1385" autoPlotX="true" yMax="0.5" autoPlotY="false" y="400" xMin="0.0" height="195" legend="true" xMax="160.0" yMin="-0.5" display="Intrinsic Motivation Gap vs Control" width="390" sizeVersion="0">
       <setup></setup>
       <update></update>
@@ -1364,22 +1372,12 @@ set-histogram-num-bars 40
 histogram [opinion] of shoppers</update>
       </pen>
     </plot>
-    <slider x="200" step="1" y="80" max="6" display="reward-cycles" height="33" min="0" direction="Horizontal" default="1.0" variable="reward-cycles" width="125" sizeVersion="0"></slider>
-    <slider x="30" step="5" y="125" max="200" display="reward-duration" height="33" min="10" direction="Horizontal" default="60.0" variable="reward-duration" width="140" sizeVersion="0"></slider>
-    <slider x="200" step="5" y="120" max="200" display="withdrawal-duration" height="33" min="10" direction="Horizontal" default="60.0" variable="withdrawal-duration" width="175" sizeVersion="0"></slider>
+    <slider x="200" step="1" y="80" max="15" display="reward-cycles" height="33" min="0" direction="Horizontal" default="0.0" variable="reward-cycles" width="125" sizeVersion="0"></slider>
     <slider x="30" step="0.05" y="160" max="1" display="low-reward-salience" height="33" min="0" direction="Horizontal" default="0.15" variable="low-reward-salience" width="165" sizeVersion="0"></slider>
     <slider x="200" step="0.05" y="160" max="1" display="high-reward-salience" height="33" min="0" direction="Horizontal" default="0.9" variable="high-reward-salience" width="175" sizeVersion="0"></slider>
-    <note x="30" y="210" backgroundDark="603979776" fontSize="12" width="240" markdown="false" height="25" textColorDark="-1" textColorLight="-16777216" backgroundLight="603979776">Social network and WOM</note>
-    <switch x="280" y="210" height="35" on="true" variable="wom-on?" display="wom-on?" width="130" sizeVersion="0"></switch>
-    <chooser x="30" y="255" height="55" variable="network-topology" current="1" display="network-topology" width="190" sizeVersion="0">
-      <choice type="string" value="small-world"></choice>
-      <choice type="string" value="preferential-attachment"></choice>
-      <choice type="string" value="ring-lattice"></choice>
-      <choice type="string" value="random"></choice>
-    </chooser>
-    <slider x="235" step="0.05" y="290" max="1" display="rewiring-probability" height="33" min="0" direction="Horizontal" default="0.2" variable="rewiring-probability" width="180" sizeVersion="0"></slider>
+    <slider x="235" step="0.05" y="290" max="1" display="rewiring-probability" height="33" min="0" direction="Horizontal" default="1.0" variable="rewiring-probability" width="180" sizeVersion="0"></slider>
     <slider x="235" step="2" y="255" max="20" display="network-degree" height="33" min="2" direction="Horizontal" default="10.0" variable="network-degree" width="180" sizeVersion="0"></slider>
-    <slider x="30" step="0.05" y="330" max="1" display="acceptance-facilitation" height="33" min="0" direction="Horizontal" default="1.0" variable="acceptance-facilitation" width="190" sizeVersion="0"></slider>
+    <slider x="30" step="0.05" y="330" max="1" display="acceptance-facilitation" height="33" min="0" direction="Horizontal" default="0.0" variable="acceptance-facilitation" width="190" sizeVersion="0"></slider>
     <monitor x="235" precision="4" y="630" height="45" fontSize="11" display="Mean |WOM opinion change|" width="195" sizeVersion="0">mean-absolute-wom-opinion-change</monitor>
     <monitor x="30" precision="4" y="630" height="45" fontSize="11" display="Network opinion receiver share" width="195" sizeVersion="0">wom-receiver-share</monitor>
     <monitor x="235" precision="4" y="570" height="45" fontSize="11" display="StdDev Opinion" width="130" sizeVersion="0">standard-deviation [opinion] of shoppers</monitor>
@@ -1388,10 +1386,22 @@ histogram [opinion] of shoppers</update>
     <monitor x="240" precision="0" y="460" height="45" fontSize="11" display="current-cycle" width="180" sizeVersion="0">current-cycle</monitor>
     <monitor x="30" precision="3" y="510" height="45" fontSize="11" width="185" sizeVersion="0">high-reward-crowding-out-effect</monitor>
     <monitor x="30" precision="17" y="460" height="45" fontSize="11" width="185" sizeVersion="0">current-phase</monitor>
-    <slider x="30" step="0.005" y="370" max="0.2" display="opinion-mutation-rate" height="33" min="0" direction="Horizontal" default="0.065" variable="opinion-mutation-rate" width="190" sizeVersion="0"></slider>
-    <slider x="30" step="0.25" y="410" max="5" display="opinion-weight" height="33" min="0" direction="Horizontal" default="3.0" variable="opinion-weight" width="190" sizeVersion="0"></slider>
+    <slider x="30" step="0.005" y="370" max="0.2" display="opinion-mutation-rate" height="33" min="0" direction="Horizontal" default="0.0" variable="opinion-mutation-rate" width="190" sizeVersion="0"></slider>
+    <slider x="30" step="0.25" y="410" max="5" display="opinion-weight" height="33" min="0" direction="Horizontal" default="5.0" variable="opinion-weight" width="190" sizeVersion="0"></slider>
     <slider x="240" step="0.05" y="410" max="2" display="confidence-bound" height="33" min="0.05" direction="Horizontal" default="0.1" variable="confidence-bound" width="180" sizeVersion="0"></slider>
     <slider x="240" step="0.01" y="330" max="1" display="baseline-acceptance" height="33" min="0" direction="Horizontal" default="0.0" variable="baseline-acceptance" width="180" sizeVersion="0"></slider>
+    <button x="30" y="15" height="40" disableUntilTicks="false" forever="false" kind="Observer" width="55">setup</button>
+    <slider x="200" step="5" y="120" max="200" display="withdrawal-duration" height="33" min="10" direction="Horizontal" default="60.0" variable="withdrawal-duration" width="175" sizeVersion="0"></slider>
+    <slider x="30" step="5" y="120" max="200" display="reward-duration" height="33" min="10" direction="Horizontal" default="60.0" variable="reward-duration" width="165" sizeVersion="0"></slider>
+    <note x="25" y="80" backgroundDark="603979776" fontSize="12" width="160" markdown="false" height="25" textColorDark="-1" textColorLight="-16777216" backgroundLight="607324939">Loyalty program</note>
+    <note x="30" y="220" backgroundDark="603979776" fontSize="12" width="190" markdown="false" height="25" textColorDark="-1" textColorLight="-16777216" backgroundLight="603979776">Social network and WOM</note>
+    <switch x="280" y="215" height="35" on="true" variable="wom-on?" display="wom-on?" width="130" sizeVersion="0"></switch>
+    <chooser x="30" y="255" height="55" variable="network-topology" current="1" display="network-topology" width="190" sizeVersion="0">
+      <choice type="string" value="small-world"></choice>
+      <choice type="string" value="preferential-attachment"></choice>
+      <choice type="string" value="ring-lattice"></choice>
+      <choice type="string" value="random"></choice>
+    </chooser>
   </widgets>
   <info><![CDATA[# Агентна модель програм лояльності, satisfaction, opinion і WOM
 
