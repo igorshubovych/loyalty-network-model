@@ -1,0 +1,374 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" width="1630" height="2225" viewBox="30 5 1630 2225">
+
+  <defs>
+    <style type="text/css"><![CDATA[
+      .node-id     { font: bold 18px 'Times New Roman', Times, serif; text-anchor: middle; fill: #1a1a1a; }
+      .node-detail { font: 16px 'Times New Roman', Times, serif; text-anchor: middle; fill: #1a1a1a; }
+      .conn-label  { font: bold 16px 'Times New Roman', Times, serif; text-anchor: middle; fill: #1a1a1a; }
+      .band-label  { font: bold 20px 'Times New Roman', Times, serif; fill: #444; }
+      .legend-text { font: 16px 'Times New Roman', Times, serif; fill: #1a1a1a; }
+      .legend-title{ font: bold 18px 'Times New Roman', Times, serif; fill: #1a1a1a; }
+
+      .band-bg     { fill: #FAFAFA; stroke: #BFBFBF; stroke-width: 1.5; stroke-dasharray: 6,5; }
+
+      .diamond     { fill: #FFFFFF; stroke: #262626; stroke-width: 2; }
+      .ellipse-term{ fill: #E9E9E9; stroke: #262626; stroke-width: 2.5; }
+
+      .role-neutral  { fill: #F2F2F2; stroke: #595959; stroke-width: 2; }
+      .role-positive { fill: #EAF4EA; stroke: #3D7A3D; stroke-width: 2; }
+      .role-negative { fill: #F7E9E9; stroke: #A13B3B; stroke-width: 2; }
+      .role-process  { fill: #E9F1F8; stroke: #2F5E8C; stroke-width: 2; }
+
+      .arrow       { fill: none; stroke: #262626; stroke-width: 2; marker-end: url(#arrowhead); }
+      .arrow-loop  { fill: none; stroke: #595959; stroke-width: 2; stroke-dasharray: 9,6; marker-end: url(#arrowhead); }
+      .conn-bg     { fill: #FFFFFF; fill-opacity: 0.92; stroke: none; }
+      .legend-swatch { stroke: #595959; stroke-width: 1.5; }
+    ]]></style>
+
+    <marker id="arrowhead" markerWidth="11" markerHeight="8" refX="11" refY="4" orient="auto">
+      <polygon points="0 0, 11 4, 0 8" fill="#262626"/>
+    </marker>
+  </defs>
+
+  <rect x="30" y="5" width="1630" height="2225" fill="#FFFFFF"/>
+
+  <!-- ============================================================ -->
+  <!-- SWIMLANE BACKGROUNDS - the three sequential passes of one tick -->
+  <!-- ============================================================ -->
+  <g id="bands">
+    <rect class="band-bg" x="50" y="10" width="1590" height="545" rx="10"/>
+    <text class="band-label" x="70" y="42">КРОК 1 — ХТО ГОВОРИТЬ (decide-to-talk)</text>
+    <rect class="band-bg" x="50" y="565" width="1590" height="525" rx="10"/>
+    <text class="band-label" x="70" y="597">КРОК 2 — ХТО ЧУЄ (heard-signal)</text>
+    <rect class="band-bg" x="50" y="1100" width="1590" height="1120" rx="10"/>
+    <text class="band-label" x="70" y="1132">КРОК 3 — ВИБІР І ОНОВЛЕННЯ СТАНУ</text>
+  </g>
+  <!-- ============================================================ -->
+  <!-- PASS 1 NODES                                                  -->
+  <!-- ============================================================ -->
+  <g id="pass1-nodes">
+
+  <!-- start-node: beginning of one tick -->
+  <g id="start">
+    <ellipse class="ellipse-term" cx="830" cy="60" rx="110" ry="40"/>
+    <text class="node-id" x="830" y="55">ТІК t</text>
+    <text class="node-detail" x="830" y="77">ПОЧИНАЄТЬСЯ</text>
+  </g>
+
+  <!-- d1-decision: gate on whether the shopper speaks this tick; full condition in the notes panel -->
+  <g id="d1">
+    <polygon class="diamond" points="830,125.0 1025.0,220 830,315.0 635.0,220"/>
+    <text class="node-id" x="830" y="215">D1 · Хоче говорити?</text>
+    <text class="node-detail" x="830" y="237">(див. примітки)</text>
+  </g>
+
+  <!-- silent-outcome: no opinion voiced -->
+  <g id="silent">
+    <rect class="role-neutral" x="335" y="182" width="210" height="75" rx="6"/>
+    <text class="node-id" x="440" y="215">МОВЧИТЬ</text>
+    <text class="node-detail" x="440" y="237">stance = 0</text>
+  </g>
+
+  <!-- d2-decision: sign of the shopper own satisfaction -->
+  <g id="d2">
+    <polygon class="diamond" points="830,360.0 985.0,440 830,520.0 675.0,440"/>
+    <text class="node-id" x="830" y="435">D2 · Знак оцінки</text>
+    <text class="node-detail" x="830" y="457">satisfaction &gt; 0 ?</text>
+  </g>
+
+  <!-- recommend-outcome: satisfied shopper speaks positively -->
+  <g id="recommend">
+    <rect class="role-positive" x="325" y="402" width="230" height="75" rx="6"/>
+    <text class="node-id" x="440" y="435">РЕКОМЕНДУЄ</text>
+    <text class="node-detail" x="440" y="457">stance = +1</text>
+  </g>
+
+  <!-- advise-outcome: dissatisfied shopper speaks negatively -->
+  <g id="advise">
+    <rect class="role-negative" x="1095" y="402" width="250" height="75" rx="6"/>
+    <text class="node-id" x="1220" y="435">ВІДМОВЛЯЄ</text>
+    <text class="node-detail" x="1220" y="457">stance = −1</text>
+  </g>
+
+  </g>
+
+  <!-- ============================================================ -->
+  <!-- PASS 2 NODES                                                  -->
+  <!-- ============================================================ -->
+  <g id="pass2-nodes">
+
+  <!-- readstances-process: every neighbour stance is frozen for this tick -->
+  <g id="readstances">
+    <rect class="role-process" x="600" y="600" width="460" height="80" rx="6"/>
+    <text class="node-id" x="830" y="635">D2' · Читає сусідів</text>
+    <text class="node-detail" x="830" y="657">stance усіх сусідів зафіксовано на початку тіку</text>
+  </g>
+
+  <!-- d3-decision: simple vs threshold contagion -->
+  <g id="d3">
+    <polygon class="diamond" points="830,740.0 1020.0,830 830,920.0 640.0,830"/>
+    <text class="node-id" x="830" y="825">D3 · Яке правило</text>
+    <text class="node-detail" x="830" y="847">зараження?</text>
+  </g>
+
+  <!-- simple-rule: one voice in a direction is enough -->
+  <g id="simple_rule">
+    <rect class="role-process" x="290" y="785" width="300" height="90" rx="6"/>
+    <text class="node-id" x="440" y="814">SIMPLE</text>
+    <text class="node-detail" x="440" y="836">signal = 1{є голос ЗА}</text>
+    <text class="node-detail" x="440" y="858">− 1{є голос ПРОТИ}</text>
+  </g>
+
+  <!-- threshold-rule: a share of neighbours (θ = adoption-threshold) must agree -->
+  <g id="threshold_rule">
+    <rect class="role-process" x="1050" y="785" width="340" height="90" rx="6"/>
+    <text class="node-id" x="1220" y="814">THRESHOLD</text>
+    <text class="node-detail" x="1220" y="836">signal = 1{частка ЗА ≥ θ}</text>
+    <text class="node-detail" x="1220" y="858">− 1{частка ПРОТИ ≥ θ}</text>
+  </g>
+
+  <!-- signal-result: the discrete signal the shopper heard this tick -->
+  <g id="signal">
+    <rect class="role-process" x="620" y="980" width="420" height="80" rx="6"/>
+    <text class="node-id" x="830" y="1015">perceived-signal</text>
+    <text class="node-detail" x="830" y="1037">∈ {−1, 0, +1}</text>
+  </g>
+
+  </g>
+
+  <!-- ============================================================ -->
+  <!-- PASS 3 NODES                                                  -->
+  <!-- ============================================================ -->
+  <g id="pass3-nodes">
+
+  <!-- d4-decision: probabilistic brand-choice draw; utility in the notes panel -->
+  <g id="d4">
+    <polygon class="diamond" points="830,1115.0 1020.0,1210 830,1305.0 640.0,1210"/>
+    <text class="node-id" x="830" y="1205">D4 · Вибір бренду</text>
+    <text class="node-detail" x="830" y="1227">u &lt; P(бренд)?</text>
+  </g>
+
+  <!-- bought-brand-outcome -->
+  <g id="bought_brand">
+    <rect class="role-positive" x="325" y="1175" width="230" height="70" rx="6"/>
+    <text class="node-id" x="440" y="1216">КУПИВ БРЕНД</text>
+  </g>
+
+  <!-- bought-rival-outcome -->
+  <g id="bought_rival">
+    <rect class="role-neutral" x="1105" y="1175" width="230" height="70" rx="6"/>
+    <text class="node-id" x="1220" y="1216">КУПИВ АЛЬТЕРНАТИВУ</text>
+  </g>
+
+  <!-- update-habit-process: habit is the moving share of recent choices -->
+  <g id="update_habit">
+    <rect class="role-process" x="620" y="1360" width="420" height="80" rx="6"/>
+    <text class="node-id" x="830" y="1395">Оновлення звички</text>
+    <text class="node-detail" x="830" y="1417">зсув 20-тікового вікна пам'яті</text>
+  </g>
+
+  <!-- d5-decision: gate for the motivation update; exact condition in the notes panel -->
+  <g id="d5">
+    <polygon class="diamond" points="830,1500.0 1025.0,1590 830,1680.0 635.0,1590"/>
+    <text class="node-id" x="830" y="1585">D5 · Винагорода</text>
+    <text class="node-detail" x="830" y="1607">застосовна?</text>
+  </g>
+
+  <!-- no-motivation-change-outcome -->
+  <g id="no_motiv">
+    <rect class="role-neutral" x="1365" y="1555" width="270" height="70" rx="6"/>
+    <text class="node-id" x="1500" y="1585">БЕЗ ЗМІН</text>
+    <text class="node-detail" x="1500" y="1607">мотивація стала</text>
+  </g>
+
+  <!-- d6-decision: crowding-out sign switch at salience-threshold -->
+  <g id="d6">
+    <polygon class="diamond" points="830,1770.0 1015.0,1860 830,1950.0 645.0,1860"/>
+    <text class="node-id" x="830" y="1855">D6 · salience ≤ θ?</text>
+    <text class="node-detail" x="830" y="1877">(θ = 0.60)</text>
+  </g>
+
+  <!-- reinforce-outcome: moderate reward confirms the behaviour -->
+  <g id="reinforce">
+    <rect class="role-positive" x="310" y="1820" width="260" height="80" rx="6"/>
+    <text class="node-id" x="440" y="1855">ПІДКРІПЛЕННЯ</text>
+    <text class="node-detail" x="440" y="1877">intrinsic motivation ↑</text>
+  </g>
+
+  <!-- erode-outcome: oversalient reward feels controlling -->
+  <g id="erode">
+    <rect class="role-negative" x="1090" y="1820" width="260" height="80" rx="6"/>
+    <text class="node-id" x="1220" y="1844">ВИТІСНЕННЯ</text>
+    <text class="node-detail" x="1220" y="1866">(crowding out)</text>
+    <text class="node-detail" x="1220" y="1888">intrinsic motivation ↓</text>
+  </g>
+
+  <!-- update-experience-process: adaptive reference point drives post-program disappointment -->
+  <g id="update_exp">
+    <rect class="role-process" x="600" y="1975" width="460" height="90" rx="6"/>
+    <text class="node-id" x="830" y="2004">Оновлення досвіду</text>
+    <text class="node-detail" x="830" y="2026">reference-level адаптується;</text>
+    <text class="node-detail" x="830" y="2048">satisfaction рухається до evaluation</text>
+  </g>
+
+  <!-- end-node: tick complete -->
+  <g id="endnode">
+    <ellipse class="ellipse-term" cx="830" cy="2170" rx="210" ry="45"/>
+    <text class="node-id" x="830" y="2165">ТІК t</text>
+    <text class="node-detail" x="830" y="2187">ЗАВЕРШЕНО</text>
+  </g>
+
+  </g>
+  <!-- ============================================================ -->
+  <!-- ARROWS - routed after every shape was placed and sized       -->
+  <!-- ============================================================ -->
+  <g id="arrows">
+
+    <!-- Pass 1: speak, sign, converge -->
+    <!-- start -> d1 -->
+    <path class="arrow" d="M 830,100 L 830,125"/>
+    <!-- d1 -> silent -->
+    <path class="arrow" d="M 635,220 L 545.0,220"/>
+    <rect class="conn-bg" x="623" y="192" width="34" height="20"/>
+    <text class="conn-label" x="640" y="208">НІ</text>
+    <!-- d1 -> d2 -->
+    <path class="arrow" d="M 830,315 L 830,360"/>
+    <rect class="conn-bg" x="834" y="307" width="43" height="20"/>
+    <text class="conn-label" x="855" y="323">ТАК</text>
+    <!-- d2 -> recommend -->
+    <path class="arrow" d="M 675,440 L 555.0,440"/>
+    <rect class="conn-bg" x="592" y="412" width="115" height="20"/>
+    <text class="conn-label" x="650" y="428">ТАК (&gt;0)</text>
+    <!-- d2 -> advise -->
+    <path class="arrow" d="M 985,440 L 1095.0,440"/>
+    <rect class="conn-bg" x="947" y="412" width="106" height="20"/>
+    <text class="conn-label" x="1000" y="428">НІ (&lt;0)</text>
+    <!-- silent -> readstances -->
+    <path class="arrow" d="M 440,257.5 L 280,560.0 L 280,575.0 L 600.0,575.0"/>
+    <!-- recommend -> readstances -->
+    <path class="arrow" d="M 440,477.5 L 440,560.0 L 600.0,560.0"/>
+    <!-- advise -> readstances -->
+    <path class="arrow" d="M 1220,477.5 L 1220,575.0 L 1060.0,575.0"/>
+    <!-- d2 -> readstances -->
+    <path class="arrow" d="M 830,520 L 830,600.0"/>
+
+    <!-- Pass 2: read neighbours, apply contagion rule -->
+    <!-- readstances -> d3 -->
+    <path class="arrow" d="M 830,680.0 L 830,740"/>
+    <!-- d3 -> simple_rule -->
+    <path class="arrow" d="M 640,830 L 590.0,830"/>
+    <rect class="conn-bg" x="605" y="802" width="70" height="20"/>
+    <text class="conn-label" x="640" y="818">simple</text>
+    <!-- d3 -> threshold_rule -->
+    <path class="arrow" d="M 1020,830 L 1050.0,830"/>
+    <rect class="conn-bg" x="966" y="802" width="97" height="20"/>
+    <text class="conn-label" x="1015" y="818">threshold</text>
+    <!-- simple_rule -> signal -->
+    <path class="arrow" d="M 440,875.0 L 440,955.0 L 620.0,955.0"/>
+    <!-- threshold_rule -> signal -->
+    <path class="arrow" d="M 1220,875.0 L 1220,955.0 L 1040.0,955.0"/>
+
+    <!-- Pass 3: buy, update habit, update motivation, update experience -->
+    <!-- signal -> d4 -->
+    <path class="arrow" d="M 830,1060.0 L 830,1115"/>
+    <!-- d4 -> bought_brand -->
+    <path class="arrow" d="M 640,1210 L 555.0,1210"/>
+    <rect class="conn-bg" x="628" y="1182" width="43" height="20"/>
+    <text class="conn-label" x="650" y="1198">ТАК</text>
+    <!-- d4 -> bought_rival -->
+    <path class="arrow" d="M 1020,1210 L 1105.0,1210"/>
+    <rect class="conn-bg" x="993" y="1182" width="34" height="20"/>
+    <text class="conn-label" x="1010" y="1198">НІ</text>
+    <!-- bought_brand -> update_habit -->
+    <path class="arrow" d="M 440,1245.0 L 440,1335.0 L 620.0,1335.0"/>
+    <!-- bought_rival -> update_habit -->
+    <path class="arrow" d="M 1220,1245.0 L 1220,1335.0 L 1040.0,1335.0"/>
+    <!-- update_habit -> d5 -->
+    <path class="arrow" d="M 830,1440.0 L 830,1500"/>
+    <!-- d5 -> no_motiv -->
+    <path class="arrow" d="M 1025,1590 L 1365.0,1590"/>
+    <rect class="conn-bg" x="1068" y="1562" width="34" height="20"/>
+    <text class="conn-label" x="1085" y="1578">НІ</text>
+    <!-- d5 -> d6 -->
+    <path class="arrow" d="M 830,1680 L 830,1770"/>
+    <rect class="conn-bg" x="834" y="1687" width="43" height="20"/>
+    <text class="conn-label" x="855" y="1703">ТАК</text>
+    <!-- d6 -> reinforce -->
+    <path class="arrow" d="M 645,1860 L 570.0,1860"/>
+    <rect class="conn-bg" x="628" y="1832" width="43" height="20"/>
+    <text class="conn-label" x="650" y="1848">ТАК</text>
+    <!-- d6 -> erode -->
+    <path class="arrow" d="M 1015,1860 L 1090.0,1860"/>
+    <rect class="conn-bg" x="998" y="1832" width="34" height="20"/>
+    <text class="conn-label" x="1015" y="1848">НІ</text>
+    <!-- reinforce -> update_exp -->
+    <path class="arrow" d="M 440,1900.0 L 440,1950.0 L 600.0,1950.0"/>
+    <!-- erode -> update_exp -->
+    <path class="arrow" d="M 1220,1900.0 L 1220,1950.0 L 1060.0,1950.0"/>
+    <!-- no_motiv -> update_exp -->
+    <path class="arrow" d="M 1500,1625.0 L 1500,1905.0 L 1060.0,1905.0"/>
+    <!-- update_exp -> endnode -->
+    <path class="arrow" d="M 830,2065.0 L 830,2125"/>
+  </g>
+
+  <!-- ============================================================ -->
+  <!-- FEEDBACK LOOP - satisfaction carries over into the next tick -->
+  <!-- ============================================================ -->
+  <g id="feedback-loop">
+    <path class="arrow-loop" d="M 620,2170 L 100,2170 L 100,60 L 720,60"/>
+    <g transform="rotate(-90 96 1115.0)">
+      <text class="conn-label" x="96" y="1115.0">satisfaction переноситься на тік t+1</text>
+    </g>
+  </g>
+
+  <!-- ============================================================ -->
+  <!-- LEGEND                                                        -->
+  <!-- ============================================================ -->
+  <g id="legend">
+    <rect class="band-bg" x="1340" y="35" width="285" height="220" rx="8"/>
+    <text class="legend-title" x="1360" y="65">Кольори</text>
+    <rect class="role-positive legend-swatch" x="1360" y="81" width="26" height="20" rx="3"/>
+    <text class="legend-text" x="1396" y="97">позитивний стан: рекомендує</text>
+    <text class="legend-text" x="1396" y="115">/ купив бренд / підкріплення</text>
+    <rect class="role-negative legend-swatch" x="1360" y="123" width="26" height="20" rx="3"/>
+    <text class="legend-text" x="1396" y="139">негативний стан: відмовляє</text>
+    <text class="legend-text" x="1396" y="157">/ витіснення мотивації</text>
+    <rect class="role-neutral legend-swatch" x="1360" y="165" width="26" height="20" rx="3"/>
+    <text class="legend-text" x="1396" y="181">нейтральний стан: мовчить</text>
+    <text class="legend-text" x="1396" y="199">/ без змін</text>
+    <rect class="role-process legend-swatch" x="1360" y="207" width="26" height="20" rx="3"/>
+    <text class="legend-text" x="1396" y="223">обчислення / агрегація</text>
+    <text class="legend-text" x="1396" y="241">стану</text>
+  </g>
+
+  <!-- ============================================================ -->
+  <!-- NOTES - the exact conditions each diamond only names          -->
+  <!-- ============================================================ -->
+  <g id="notes-panel">
+    <rect class="band-bg" x="1340" y="320" width="300" height="750" rx="8"/>
+    <text class="legend-title" x="1360" y="354">Примітки</text>
+    <text class="legend-text" x="1360" y="388" style="font-weight:bold">D1</text>
+    <text class="legend-text" x="1398" y="372">wom-on? = true</text>
+    <text class="legend-text" x="1398" y="392">|satisfaction| &gt; talk-margin,</text>
+    <text class="legend-text" x="1398" y="412">random &lt; talk-activity</text>
+    <text class="legend-text" x="1360" y="466" style="font-weight:bold">D2</text>
+    <text class="legend-text" x="1398" y="450">знак satisfaction</text>
+    <text class="legend-text" x="1398" y="470">(&gt; 0 чи &lt; 0)</text>
+    <text class="legend-text" x="1360" y="524" style="font-weight:bold">D3</text>
+    <text class="legend-text" x="1398" y="508">simple: ≥1 голос</text>
+    <text class="legend-text" x="1398" y="528">threshold: частка ≥</text>
+    <text class="legend-text" x="1398" y="548">adoption-threshold</text>
+    <text class="legend-text" x="1360" y="602" style="font-weight:bold">D4</text>
+    <text class="legend-text" x="1398" y="586">P = logistic(β·U)</text>
+    <text class="legend-text" x="1398" y="606">U = mot + habit + reward</text>
+    <text class="legend-text" x="1398" y="626">+ talk·signal − price</text>
+    <text class="legend-text" x="1360" y="680" style="font-weight:bold">D5</text>
+    <text class="legend-text" x="1398" y="664">reward active</text>
+    <text class="legend-text" x="1398" y="684">AND chose brand</text>
+    <text class="legend-text" x="1360" y="738" style="font-weight:bold">D6</text>
+    <text class="legend-text" x="1398" y="722">θ = 0.60</text>
+    <text class="legend-text" x="1398" y="742">(константа, не UI-параметр)</text>
+  </g>
+
+</svg>
