@@ -1,0 +1,2536 @@
+<?xml version="1.0" encoding="utf-8"?>
+<model version="NetLogo 7.0.4" snapToGrid="true">
+  <code><![CDATA[extensions [nw]
+
+breed [shoppers shopper]
+
+;; =========================================================
+;; ПРИЗНАЧЕННЯ
+;; =========================================================
+;; Що залишається від поведінки покупця після завершення програми
+;; лояльності, і що з цим робить word of mouth?
+;;
+;; Модель поєднує чотири механізми:
+;;   винагорода    — зовнішній стимул під час кампанії;
+;;   звичка        — повторення закріплює вибір;
+;;   crowding out  — надто помітна винагорода витісняє внутрішню мотивацію;
+;;   розмова       — досвід передається мережею й повертається у вибір.
+;;
+;; АРХІТЕКТУРА (модулі рівного рівня, жоден не викликає контролер):
+;;   1) Контролер          — go, послідовність кроків;
+;;   2) Розклад            — фази baseline / campaign / pause / final;
+;;   3) Розмова            — хто говорить і що чує сусід;
+;;   4) Рішення            — корисність -> імовірність вибору бренду;
+;;   5) Поведінковий стан  — звичка та внутрішня мотивація;
+;;   6) Досвід             — satisfaction відносно адаптивної точки відліку;
+;;   7) Метрики            — накопичення та репортери для BehaviorSpace;
+;;   8) Візуалізація.
+;;
+;; КЛЮЧОВЕ ПРОЄКТНЕ РІШЕННЯ. Усередині запуску немає control-групи.
+;; Причина: при увімкненому WoM «контрольний» агент чує сусідів, які
+;; отримують бонуси, тому він не є контролем. Усі порівняння —
+;; МІЖ ЗАПУСКАМИ (program-on? та wom-on? як фактори). Через це розклад
+;; фаз навмисно НЕ залежить від program-on?: прогон має однакову
+;; довжину й однакову структуру вікон в усіх чотирьох клітинках
+;; факторіалу, а вимкнена програма означає лише те, що під час
+;; campaign-фази не нараховується винагорода.
+
+globals [
+  ;; ---- стан розкладу ----
+  current-phase      ;; "baseline" | "campaign" | "pause" | "final"
+  current-cycle      ;; номер кампанії, 0 під час baseline
+
+  ;; ---- константи розкладу (не в UI) ----
+  baseline-duration  ;; тіки спостереження до першої кампанії
+  reward-duration    ;; тривалість однієї кампанії
+  pause-duration     ;; пауза між кампаніями
+  final-duration     ;; фінальне спостереження після останньої кампанії
+
+  ;; ---- поведінкові константи (не в UI) ----
+  habit-memory-window     ;; горизонт поведінкової пам'яті, тіки
+  salience-threshold      ;; поріг, вище якого винагорода витісняє мотивацію
+  motivation-gain         ;; масштаб зміни внутрішньої мотивації
+  brand-price-premium     ;; відносна вартість бренду
+  choice-sharpness        ;; крутизна логістичного правила вибору
+  network-degree          ;; цільовий середній степінь вузла
+
+  ;; ---- константи досвіду (не в UI) ----
+  brand-experience        ;; базова якість покупки бренду
+  rival-experience        ;; якість альтернативи
+  reward-experience-bonus ;; внесок бонусу у відчуття від покупки
+  reference-adapt         ;; швидкість адаптації точки відліку
+  satisfaction-gain       ;; чутливість оцінки до відхилення від відліку
+  satisfaction-memory     ;; інерція satisfaction
+  baseline-liking         ;; постійний зсув оцінки; 0 навмисно.
+                          ;; Будь-яке ненульове значення дає систематичний
+                          ;; нахил, який через опуклість логістичної функції
+                          ;; і зворотний зв'язок зі звичкою розганяється
+                          ;; в лавину незалежно від програми.
+  talk-margin             ;; |satisfaction|, з якого людині є що сказати.
+                          ;; 0.40 підібрано так, щоб у стаціонарному стані
+                          ;; майже ніхто не говорив: розмову породжують ЗМІНИ
+                          ;; (старт і скасування кампанії), а не рівень.
+                          ;; При малому значенні (0.10) канал сам собою
+                          ;; насичує ринок ще під час baseline, і порівняння
+                          ;; wom off / wom on вироджується.
+  persistence-tolerance   ;; запас над baseline, який ще вважається «вище»
+
+  ;; ---- накопичувачі метрик ----
+  baseline-choices  baseline-ticks
+  campaign-choices  campaign-ticks
+  pause-choices     pause-ticks
+  final-choices     final-ticks
+
+  baseline-share-level     ;; частка вибору бренду за baseline-фазу
+  baseline-habit-level     ;; середня звичка на кінець baseline
+  initial-motivation-level ;; середня внутрішня мотивація на старті
+  ticks-above-baseline     ;; тіки final-фази зі звичкою вище baseline
+  collapse-tick            ;; перший тік final-фази, коли звичка впала; -1 = не впала
+]
+
+shoppers-own [
+  ;; ---- поведінковий стан ----
+  intrinsic-motivation   ;; [0;1] внутрішня цінність бренду для агента
+  habit                  ;; [0;1] частка покупок бренду у вікні пам'яті
+  recent-choices         ;; список 0/1 довжини habit-memory-window
+  chose-brand?           ;; результат вибору на поточному тіку
+
+  ;; ---- сталі індивідуальні риси (генеруються в setup) ----
+  price-sensitivity
+  habit-sensitivity
+  reward-sensitivity
+  autonomy-sensitivity   ;; наскільки болісно сприймається зовнішній контроль
+
+  ;; ---- досвід і розмова ----
+  satisfaction     ;; [-1;1] накопичена оцінка останніх покупок
+  reference-level  ;; адаптивна точка відліку: до чого агент звик
+  talking?         ;; чи говорить агент на цьому тіку
+  stance           ;; 1 рекомендує, -1 відмовляє, 0 мовчить
+  perceived-signal ;; [-1;1] що агент почув від сусідів цього тіку
+]
+
+
+;; =========================================================
+;; ПАРАМЕТРИ ІНТЕРФЕЙСУ
+;; =========================================================
+;; Одинадцять контролів, згрупованих за призначенням.
+;;
+;; ПРОГРАМА
+;;   number-of-shoppers    розмір популяції;
+;;   reward-cycles         кількість кампаній;
+;;   program-on?           чи нараховується винагорода взагалі;
+;;   reward-salience       психологічна помітність бонусу, не його сума.
+;;
+;; РОЗМОВА
+;;   wom-on?               чи існує канал word of mouth;
+;;   talk-activity         імовірність, що агент, якому є що сказати,
+;;                         справді говорить на цьому тіку;
+;;   contagion-rule        "simple" — досить одного голосу;
+;;                         "threshold" — потрібна критична частка сусідів;
+;;   adoption-threshold    ця критична частка (діє лише для "threshold");
+;;   talk-strength         вага почутого сигналу в корисності вибору.
+;;
+;; МЕРЕЖА
+;;   network-topology      "small-world" | "preferential-attachment";
+;;   rewiring-probability  частка перепідключених ребер (лише small-world).
+;;
+;; Усе інше — константи в initialize-constants та розподіли рис у
+;; initialize-shopper. Їх свідомо не виведено в UI: вони визначають
+;; масштаб моделі, а не сценарій політики.
+
+
+;; =========================================================
+;; ІНІЦІАЛІЗАЦІЯ
+;; =========================================================
+
+to initialize-constants
+  set baseline-duration 50
+  set reward-duration 40
+  set pause-duration 20
+  set final-duration 100
+
+  set habit-memory-window 20
+  set salience-threshold 0.60
+  set motivation-gain 4.0
+  set brand-price-premium 1.70
+  set choice-sharpness 1.50
+  set network-degree 8
+
+  set brand-experience 0.30
+  set rival-experience -0.10
+  set reward-experience-bonus 0.50
+  set reference-adapt 0.05
+  set satisfaction-gain 2.0
+  set satisfaction-memory 0.25
+  set baseline-liking 0.00
+  set talk-margin 0.40
+  set persistence-tolerance 0.01
+end
+
+
+to setup
+  clear-all
+  initialize-constants
+  validate-configuration
+  no-display
+
+  set current-phase "baseline"
+  set current-cycle 0
+  set baseline-choices 0   set baseline-ticks 0
+  set campaign-choices 0   set campaign-ticks 0
+  set pause-choices 0      set pause-ticks 0
+  set final-choices 0      set final-ticks 0
+  set baseline-share-level 0
+  set baseline-habit-level 0
+  set ticks-above-baseline 0
+  set collapse-tick -1
+
+  build-network
+
+  set initial-motivation-level mean [intrinsic-motivation] of shoppers
+
+  reset-ticks
+  update-view
+  display
+end
+
+
+;; Конфігурація перевіряється до створення агентів: модель або
+;; запускається з коректним сценарієм, або одразу пояснює, що не так.
+to validate-configuration
+  if number-of-shoppers < 20 [
+    error "number-of-shoppers must be at least 20"
+  ]
+  if number-of-shoppers != floor number-of-shoppers [
+    error "number-of-shoppers must be an integer"
+  ]
+  if number-of-shoppers <= network-degree [
+    error "number-of-shoppers must exceed the network degree (8)"
+  ]
+  if reward-cycles < 1 [
+    error "reward-cycles must be at least 1 (use program-on? to switch the program off)"
+  ]
+  if reward-salience < 0 or reward-salience > 1 [
+    error "reward-salience must be in [0, 1]"
+  ]
+  if talk-activity < 0 or talk-activity > 1 [
+    error "talk-activity must be in [0, 1]"
+  ]
+  if adoption-threshold <= 0 or adoption-threshold > 1 [
+    error "adoption-threshold must be in (0, 1]"
+  ]
+  if talk-strength < 0 [
+    error "talk-strength must be non-negative"
+  ]
+  if rewiring-probability < 0 or rewiring-probability > 1 [
+    error "rewiring-probability must be in [0, 1]"
+  ]
+  if not member? network-topology
+    ["small-world" "preferential-attachment"] [
+    error "network-topology must be small-world or preferential-attachment"
+  ]
+  if not member? contagion-rule ["simple" "threshold"] [
+    error "contagion-rule must be simple or threshold"
+  ]
+end
+
+
+;; Мережа статична в межах запуску. Генератори nw створюють агентів
+;; і ребра одночасно, тому окремого повільного етапу створення links немає.
+to build-network
+  ;; Для Watts–Strogatz neighborhood-size — кількість сусідів з кожного
+  ;; боку кільця, очікуваний степінь 2k. Для Barabási–Albert середній
+  ;; степінь приблизно 2m. Обидва генератори дають однаковий цільовий
+  ;; середній степінь, тому топології порівнянні за щільністю.
+  let half-degree max list 1 floor (network-degree / 2)
+
+  if network-topology = "small-world" [
+    nw:generate-watts-strogatz
+      shoppers links number-of-shoppers half-degree rewiring-probability
+      [ initialize-shopper ]
+  ]
+
+  if network-topology = "preferential-attachment" [
+    nw:generate-preferential-attachment
+      shoppers links number-of-shoppers half-degree
+      [ initialize-shopper ]
+  ]
+
+  nw:set-context shoppers links
+
+  ;; Ребра не малюються: при 800 агентах і степені 8 це кілька тисяч
+  ;; ліній, які нічого не показують і сильно сповільнюють вигляд.
+  ask links [ set hidden? true ]
+end
+
+
+to initialize-shopper
+  set shape "person"
+  set size 0.7
+
+  ;; Обрізані нормальні розподіли дають гетерогенну популяцію,
+  ;; не породжуючи надлишку крайніх типів агентів.
+  set intrinsic-motivation bounded-normal 0.50 0.15 0 1
+  set price-sensitivity    bounded-normal 1.00 0.25 0.50 1.50
+  set habit-sensitivity    bounded-normal 1.50 0.25 0.75 2.25
+  set reward-sensitivity   bounded-normal 1.50 0.25 0.50 2.50
+  set autonomy-sensitivity bounded-normal 0.50 0.20 0 1
+
+  let starting-habit bounded-normal 0.22 0.10 0 1
+  set recent-choices n-values habit-memory-window [
+    ifelse-value (random-float 1 < starting-habit) [1] [0]
+  ]
+  set habit mean recent-choices
+
+  set satisfaction bounded-normal 0 0.10 -1 1
+  set reference-level 0
+  set talking? false
+  set stance 0
+  set perceived-signal 0
+  set chose-brand? false
+end
+
+
+;; =========================================================
+;; КОНТРОЛЕР
+;; =========================================================
+;; Крок тіку розділений на три послідовні проходи по популяції.
+;; Це модельне припущення, а не деталь реалізації: злиття проходів
+;; в один ask зробило б результат залежним від випадкового порядку
+;; агентів усередині ask.
+;;   Прохід 1: хто цього тіку говорить і що саме.
+;;   Прохід 2: кожен читає сусідів (усі стани зафіксовані проходом 1).
+;;   Прохід 3: вибір і оновлення власного стану.
+
+to go
+  if simulation-finished? [ stop ]
+
+  update-phase
+
+  ask shoppers [ decide-to-talk ]
+  ask shoppers [ set perceived-signal heard-signal ]
+  ask shoppers [
+    choose-brand
+    update-habit
+    update-motivation
+    update-experience
+  ]
+
+  record-tick
+  update-view
+  tick
+end
+
+
+to-report simulation-finished?
+  report ticks >= experiment-end
+end
+
+
+;; =========================================================
+;; МОДУЛЬ РОЗКЛАДУ
+;; =========================================================
+;; Розклад НЕ залежить від program-on?. Вимкнена програма означає
+;; нульову винагороду під час campaign-фази, а не коротший прогон.
+;; Саме це робить факторіал program x wom коректним: усі чотири
+;; клітинки мають однакову довжину прогону та однакові вікна метрик.
+
+;; Програма ЗАВЕРШУЄТЬСЯ кампанією, а не паузою:
+;; baseline | [campaign + pause] x (cycles - 1) | campaign | final
+;; Інакше final-фаза починалася б після паузи, під час якої звичка вже
+;; встигла обвалитися, і вимірювання тривалості утримання втрачало б сенс.
+to-report program-window
+  report (reward-cycles - 1) * (reward-duration + pause-duration)
+       + reward-duration
+end
+
+to-report experiment-end
+  report baseline-duration + program-window + final-duration
+end
+
+to-report phase-at [time]
+  if time < baseline-duration [ report "baseline" ]
+
+  let elapsed time - baseline-duration
+  if elapsed >= program-window [ report "final" ]
+
+  let cycle-length reward-duration + pause-duration
+  ifelse (elapsed mod cycle-length) < reward-duration [
+    report "campaign"
+  ]
+  [
+    report "pause"
+  ]
+end
+
+to-report cycle-at [time]
+  if time < baseline-duration [ report 0 ]
+  let elapsed time - baseline-duration
+  let cycle-length reward-duration + pause-duration
+  report min list reward-cycles (1 + floor (elapsed / cycle-length))
+end
+
+to update-phase
+  set current-phase phase-at ticks
+  set current-cycle cycle-at ticks
+end
+
+;; Єдина точка визначення поточної політики винагороди.
+to-report active-reward-salience
+  if not program-on? [ report 0 ]
+  if current-phase != "campaign" [ report 0 ]
+  report reward-salience
+end
+
+
+;; =========================================================
+;; МОДУЛЬ РОЗМОВИ (WORD OF MOUTH)
+;; =========================================================
+;; Розмова — цілеспрямована дія (Berger, 2014): задоволений покупець
+;; рекомендує, розчарований відмовляє. Обидва напрями симетричні:
+;; venting — така сама функція обміну, як і похвала.
+;;
+;; talk-activity відокремлює НАЯВНІСТЬ думки від АКТУ її висловлення.
+;; Агент говорить лише якщо (а) йому є що сказати, тобто |satisfaction|
+;; перевищує talk-margin, і (б) випав його тік.
+
+to decide-to-talk
+  set talking? false
+  set stance 0
+  if not wom-on? [ stop ]
+  if random-float 1 >= talk-activity [ stop ]
+
+  if satisfaction > talk-margin [
+    set talking? true
+    set stance 1
+    stop
+  ]
+  if satisfaction < (- talk-margin) [
+    set talking? true
+    set stance -1
+  ]
+end
+
+
+;; Правило зараження визначає, коли почуте взагалі рахується.
+;;
+;; simple (Centola & Macy, 2007: проста контагія; Deutsch & Gerard, 1955:
+;;   інформаційний маршрут) — одного голосу достатньо. Сигнал залежить
+;;   лише від того, чи прозвучав хоч один голос кожного знаку.
+;;
+;; threshold (Granovetter, 1978; Watts, 2002: нормативний маршрут) —
+;;   голос рахується, лише коли частка сусідів, що говорять у цей бік,
+;;   перевищує adoption-threshold. Знаменник — УСІ сусіди, а не лише
+;;   ті, хто говорить: тиск створює саме частка кола, а не частка
+;;   висловлених думок.
+;;
+;; Обидва правила повертають значення в {-1, 0, 1}: два зустрічні
+;; потоки гасять один одного, тому змішане коло дає нульовий сигнал.
+to-report heard-signal
+  if not wom-on? [ report 0 ]
+
+  let neighborhood-size count link-neighbors
+  if neighborhood-size = 0 [ report 0 ]
+
+  let voices-for    count link-neighbors with [stance = 1]
+  let voices-against count link-neighbors with [stance = -1]
+
+  if contagion-rule = "simple" [
+    report (ifelse-value (voices-for > 0) [1] [0])
+         - (ifelse-value (voices-against > 0) [1] [0])
+  ]
+
+  report (ifelse-value (voices-for / neighborhood-size >= adoption-threshold) [1] [0])
+       - (ifelse-value (voices-against / neighborhood-size >= adoption-threshold) [1] [0])
+end
+
+
+;; =========================================================
+;; МОДУЛЬ ПРИЙНЯТТЯ РІШЕННЯ
+;; =========================================================
+;; Корисність вибору бренду:
+;;
+;;   U_i = m_i + s^h_i h_i + s^r_i r + w g_i - s^p_i c
+;;
+;;   m    intrinsic-motivation (вага жорстко 1: інакше модель вироджена)
+;;   s^h  habit-sensitivity,  h  habit
+;;   s^r  reward-sensitivity, r  active-reward-salience
+;;   w    talk-strength,      g  perceived-signal   (0 при wom-on? = false)
+;;   s^p  price-sensitivity,  c  brand-price-premium
+;;
+;; Соціальний доданок асимілятивний: сигнал тягне агента туди, куди
+;; тягне його оточення (Flache et al., 2017).
+;;
+;; ІДЕНТИФІКОВАНІСТЬ. choice-sharpness множить усю U, тому спільне
+;; масштабування всіх ваг дає ту саму модель. При калібруванні
+;; фіксуйте choice-sharpness і шукайте решту.
+
+to choose-brand
+  set chose-brand? random-float 1 < logistic (choice-sharpness * brand-utility)
+end
+
+to-report brand-utility
+  report intrinsic-motivation
+    + habit-sensitivity * habit
+    + reward-sensitivity * active-reward-salience
+    + social-contribution
+    - price-sensitivity * brand-price-premium
+end
+
+to-report social-contribution
+  if not wom-on? [ report 0 ]
+  report talk-strength * perceived-signal
+end
+
+
+;; =========================================================
+;; МОДУЛЬ ПОВЕДІНКОВОГО СТАНУ
+;; =========================================================
+
+;; Звичка — ковзна частка покупок бренду у скінченному вікні пам'яті.
+;; Вона формується виключно повторенням, тому окремі habit-learning-rate
+;; і habit-decay-rate не потрібні: обидва задані довжиною вікна.
+to update-habit
+  set recent-choices
+    fput (ifelse-value chose-brand? [1] [0]) (but-last recent-choices)
+  set habit mean recent-choices
+end
+
+
+;; CROWDING OUT.
+;;
+;;   signal = G * r * (theta - r) / W
+;;
+;;   r > 0    винагорода фактично нарахована
+;;   theta    salience-threshold
+;;   G        motivation-gain, W habit-memory-window
+;;
+;; Одна формула дає обидва режими: помірний бонус (r < theta) підтверджує
+;; цінність поведінки, надмірний (r > theta) сприймається як зовнішній
+;; контроль і витісняє внутрішню мотивацію.
+;;
+;; Множник r у чисельнику є істотним. Без нього нульова винагорода дає
+;; НАЙБІЛЬШЕ позитивне підкріплення (theta - 0 = theta), тобто відсутність
+;; стимулу максимально зміцнює мотивацію. Тут signal(0) = 0: немає бонусу —
+;; немає ефекту бонусу.
+;;
+;; Підкріплення множиться на (1 - m), витіснення — на m, тому обидва
+;; процеси насичуються біля меж [0; 1]. Індивідуальна autonomy-sensitivity
+;; діє лише на витіснення: люди по-різному переносять контроль, але
+;; однаково приймають підтвердження.
+;;
+;; ПЕРЕДУМОВИ: винагорода активна І агент справді купив бренд.
+;; Поза цим мотивація не змінюється — модель не має механізму
+;; самостійного відновлення мотивації, і це свідоме обмеження:
+;; витіснення тут незворотне в межах прогону.
+to update-motivation
+  let salience active-reward-salience
+  if salience <= 0 [ stop ]
+  if not chose-brand? [ stop ]
+
+  let signal motivation-gain * salience * (salience-threshold - salience)
+             / habit-memory-window
+
+  ifelse signal >= 0 [
+    set intrinsic-motivation
+      clamp (intrinsic-motivation + signal * (1 - intrinsic-motivation)) 0 1
+  ]
+  [
+    set intrinsic-motivation
+      clamp (intrinsic-motivation
+             + autonomy-sensitivity * signal * intrinsic-motivation) 0 1
+  ]
+end
+
+
+;; =========================================================
+;; МОДУЛЬ ДОСВІДУ
+;; =========================================================
+;; Satisfaction вимірює не абсолютну якість покупки, а відхилення від
+;; того, до чого агент ЗВИК. reference-level — адаптивна точка відліку,
+;; повільне середнє минулого досвіду.
+;;
+;; Саме звідси береться післяпрограмне розчарування. Під час кампанії
+;; точка відліку піднімається до рівня «покупка + бонус». Коли програму
+;; скасовано, той самий товар без бонусу опиняється НИЖЧЕ звичного рівня,
+;; satisfaction падає в мінус, і мережею йде хвиля негативних відгуків.
+;; Без адаптивного відліку скасування бонусу дало б лише повернення до
+;; помірно позитивної оцінки, і механізму розчарування не існувало б.
+to update-experience
+  let experience rival-experience
+  if chose-brand? [
+    set experience brand-experience
+      + reward-experience-bonus * active-reward-salience
+  ]
+
+  set reference-level
+    reference-level + reference-adapt * (experience - reference-level)
+
+  let evaluation clamp
+    (satisfaction-gain * (experience - reference-level) + baseline-liking)
+    -1 1
+
+  ;; Шум відображає варіативність обслуговування та суб'єктивного сприйняття.
+  set satisfaction clamp
+    (satisfaction
+     + satisfaction-memory * (evaluation + random-normal 0 0.05 - satisfaction))
+    -1 1
+end
+
+
+;; =========================================================
+;; МОДУЛЬ МЕТРИК: НАКОПИЧЕННЯ
+;; =========================================================
+
+to record-tick
+  let population count shoppers
+  let buyers count shoppers with [chose-brand?]
+  let habit-level mean [habit] of shoppers
+
+  if current-phase = "baseline" [
+    set baseline-choices baseline-choices + buyers
+    set baseline-ticks baseline-ticks + 1
+    set baseline-share-level
+      baseline-choices / (population * baseline-ticks)
+    ;; Рівень звички на кінець baseline — опорна лінія для persistence.
+    set baseline-habit-level habit-level
+  ]
+
+  if current-phase = "campaign" [
+    set campaign-choices campaign-choices + buyers
+    set campaign-ticks campaign-ticks + 1
+  ]
+
+  if current-phase = "pause" [
+    set pause-choices pause-choices + buyers
+    set pause-ticks pause-ticks + 1
+  ]
+
+  if current-phase = "final" [
+    set final-choices final-choices + buyers
+    set final-ticks final-ticks + 1
+
+    ;; ТРИВАЛІСТЬ, а не лише рівень. Питання експерименту 2 —
+    ;; «чи розмова тримає звичку вище baseline ДОВШЕ». Порівнюється
+    ;; середня звичка, а не миттєва частка покупок: звичка вже є
+    ;; ковзним середнім за 20 тіків, тому не потребує згладжування
+    ;; і не породжує хибних перетинів через шум вибірки.
+    ifelse habit-level > baseline-habit-level + persistence-tolerance [
+      set ticks-above-baseline ticks-above-baseline + 1
+    ]
+    [
+      if collapse-tick = -1 [ set collapse-tick final-ticks ]
+    ]
+  ]
+end
+
+
+;; =========================================================
+;; МОДУЛЬ МЕТРИК: РЕПОРТЕРИ
+;; =========================================================
+
+to-report current-brand-share
+  if not any? shoppers [ report 0 ]
+  report count shoppers with [chose-brand?] / count shoppers
+end
+
+to-report brand-share [phase-name]
+  let population count shoppers
+  if population = 0 [ report 0 ]
+
+  if phase-name = "baseline" [
+    report safe-rate baseline-choices (population * baseline-ticks)
+  ]
+  if phase-name = "campaign" [
+    report safe-rate campaign-choices (population * campaign-ticks)
+  ]
+  if phase-name = "pause" [
+    report safe-rate pause-choices (population * pause-ticks)
+  ]
+  if phase-name = "final" [
+    report safe-rate final-choices (population * final-ticks)
+  ]
+  report 0
+end
+
+
+;; ПІДЙОМ ПРОГРАМИ: наскільки campaign-фаза підняла частку бренду
+;; відносно власного baseline того самого запуску. Для експерименту 1
+;; порівнюються значення цього репортера між запусками з wom-on? false і true.
+to-report program-lift
+  report brand-share "campaign" - brand-share "baseline"
+end
+
+;; PERSISTENCE INDEX: чи тримається поведінка вище baseline після
+;; завершення програми. > 0 залишок є; = 0 повернення до baseline; < 0 нижче.
+to-report persistence-index
+  report brand-share "final" - brand-share "baseline"
+end
+
+;; Яка частка досягнутого під час кампанії рівня збереглася.
+to-report retention-ratio
+  report safe-rate (brand-share "final") (brand-share "campaign")
+end
+
+to-report withdrawal-drop
+  report brand-share "campaign" - brand-share "final"
+end
+
+;; Скільки тіків final-фази звичка протрималася вище baseline.
+;; Разом із ticks-to-collapse відповідає на «довше чи ні».
+to-report ticks-to-collapse
+  if collapse-tick = -1 [ report final-duration ]
+  report collapse-tick
+end
+
+to-report mean-habit
+  if not any? shoppers [ report 0 ]
+  report mean [habit] of shoppers
+end
+
+to-report habit-spread
+  if count shoppers < 2 [ report 0 ]
+  report standard-deviation [habit] of shoppers
+end
+
+to-report mean-motivation
+  if not any? shoppers [ report 0 ]
+  report mean [intrinsic-motivation] of shoppers
+end
+
+;; Скільки внутрішньої мотивації втрачено відносно старту прогону.
+;; Додатне значення = crowding out відбувся.
+to-report motivation-loss
+  report initial-motivation-level - mean-motivation
+end
+
+to-report mean-satisfaction
+  if not any? shoppers [ report 0 ]
+  report mean [satisfaction] of shoppers
+end
+
+;; Частка тих, хто рекомендує САМЕ ЗАРАЗ (говорить на цьому тіку).
+to-report share-recommending
+  if not any? shoppers [ report 0 ]
+  report count shoppers with [stance = 1] / count shoppers
+end
+
+to-report share-advising-against
+  if not any? shoppers [ report 0 ]
+  report count shoppers with [stance = -1] / count shoppers
+end
+
+;; Частка тих, кому Є ЩО сказати, незалежно від того, чи випав їм голос.
+;; Стабільніша за share-recommending, бо не залежить від talk-activity.
+to-report share-satisfied
+  if not any? shoppers [ report 0 ]
+  report count shoppers with [satisfaction > talk-margin] / count shoppers
+end
+
+to-report share-dissatisfied
+  if not any? shoppers [ report 0 ]
+  report count shoppers with [satisfaction < (- talk-margin)] / count shoppers
+end
+
+;; Частка агентів, які цього тіку отримали ненульовий сигнал.
+;; Показує, чи канал взагалі працює при заданому adoption-threshold.
+to-report share-reached
+  if not any? shoppers [ report 0 ]
+  report count shoppers with [perceived-signal != 0] / count shoppers
+end
+
+to-report mean-network-degree
+  if not any? shoppers [ report 0 ]
+  report mean [count link-neighbors] of shoppers
+end
+
+
+;; =========================================================
+;; МОДУЛЬ ВІЗУАЛІЗАЦІЇ
+;; =========================================================
+;; Позиція агента кодує його стан, а не місце в мережі:
+;; X = внутрішня мотивація, Y = сила звички. Розшарування хмари по Y
+;; означає, що популяція поділилася на лояльну та нелояльну групи.
+;; Колір — поточна роль у розмові.
+
+to update-view
+  ask shoppers [
+    setxy
+      clamp (scale-to-world intrinsic-motivation min-pxcor max-pxcor) min-pxcor max-pxcor
+      clamp (scale-to-world habit min-pycor max-pycor) min-pycor max-pycor
+
+    if stance = 1  [ set color green ]
+    if stance = -1 [ set color red ]
+    if stance = 0  [ set color gray ]
+
+    set size ifelse-value chose-brand? [1] [0.55]
+  ]
+end
+
+to-report scale-to-world [value minimum maximum]
+  report minimum + value * (maximum - minimum)
+end
+
+
+;; =========================================================
+;; ДОПОМІЖНІ ФУНКЦІЇ
+;; =========================================================
+
+to-report safe-rate [numerator denominator]
+  if denominator = 0 [ report 0 ]
+  report numerator / denominator
+end
+
+to-report logistic [value]
+  ;; Обмеження аргументу запобігає переповненню exp().
+  report 1 / (1 + exp (- (clamp value -20 20)))
+end
+
+to-report clamp [value minimum maximum]
+  report max list minimum (min list maximum value)
+end
+
+to-report bounded-normal [mean-value deviation minimum maximum]
+  report clamp (random-normal mean-value deviation) minimum maximum
+end
+]]></code>
+  <widgets>
+    <view x="440" wrappingAllowedX="false" y="10" frameRate="30.0" minPycor="-16" height="245" showTickCounter="true" patchSize="7.0" fontSize="10" wrappingAllowedY="false" width="245" tickCounterLabel="ticks" maxPycor="16" updateMode="1" maxPxcor="16" minPxcor="-16"></view>
+    <button x="10" y="10" height="35" disableUntilTicks="false" forever="false" kind="Observer" width="60">setup</button>
+    <button x="80" y="10" height="35" disableUntilTicks="false" forever="true" kind="Observer" width="60">go</button>
+    <monitor x="150" precision="17" y="10" height="45" fontSize="11" display="phase" width="130" sizeVersion="0">current-phase</monitor>
+    <monitor x="290" precision="0" y="10" height="45" fontSize="11" display="cycle" width="140" sizeVersion="0">current-cycle</monitor>
+    <note x="10" y="62" backgroundDark="603979776" fontSize="12" width="420" markdown="false" height="22" textColorDark="-1" textColorLight="-16777216" backgroundLight="603979776">PROGRAM</note>
+    <slider x="10" step="20" y="88" max="3000" display="number-of-shoppers" height="33" min="20" direction="Horizontal" default="800.0" variable="number-of-shoppers" width="205" sizeVersion="0"></slider>
+    <slider x="225" step="1" y="88" max="6" display="reward-cycles" height="33" min="1" direction="Horizontal" default="2.0" variable="reward-cycles" width="205" sizeVersion="0"></slider>
+    <switch x="10" y="126" height="33" on="true" variable="program-on?" display="program-on?" width="205" sizeVersion="0"></switch>
+    <slider x="225" step="0.05" y="126" max="1.0" display="reward-salience" height="33" min="0.0" direction="Horizontal" default="0.75" variable="reward-salience" width="205" sizeVersion="0"></slider>
+    <note x="10" y="168" backgroundDark="603979776" fontSize="12" width="420" markdown="false" height="22" textColorDark="-1" textColorLight="-16777216" backgroundLight="603979776">TALK (word of mouth)</note>
+    <switch x="10" y="194" height="33" on="true" variable="wom-on?" display="wom-on?" width="205" sizeVersion="0"></switch>
+    <slider x="225" step="0.05" y="194" max="1.0" display="talk-activity" height="33" min="0.0" direction="Horizontal" default="0.5" variable="talk-activity" width="205" sizeVersion="0"></slider>
+    <chooser x="10" y="232" height="55" variable="contagion-rule" current="0" display="contagion-rule" width="205" sizeVersion="0">
+      <choice type="string" value="simple"></choice>
+      <choice type="string" value="threshold"></choice>
+    </chooser>
+    <slider x="225" step="0.25" y="232" max="4.0" display="talk-strength" height="33" min="0.0" direction="Horizontal" default="1.5" variable="talk-strength" width="205" sizeVersion="0"></slider>
+    <slider x="225" step="0.05" y="270" max="1.0" display="adoption-threshold" height="33" min="0.05" direction="Horizontal" default="0.25" variable="adoption-threshold" width="205" sizeVersion="0"></slider>
+    <note x="10" y="312" backgroundDark="603979776" fontSize="12" width="420" markdown="false" height="22" textColorDark="-1" textColorLight="-16777216" backgroundLight="603979776">NETWORK</note>
+    <chooser x="10" y="338" height="55" variable="network-topology" current="0" display="network-topology" width="205" sizeVersion="0">
+      <choice type="string" value="small-world"></choice>
+      <choice type="string" value="preferential-attachment"></choice>
+    </chooser>
+    <slider x="225" step="0.05" y="338" max="1.0" display="rewiring-probability" height="33" min="0.0" direction="Horizontal" default="0.1" variable="rewiring-probability" width="205" sizeVersion="0"></slider>
+    <note x="10" y="400" backgroundDark="603979776" fontSize="12" width="420" markdown="false" height="22" textColorDark="-1" textColorLight="-16777216" backgroundLight="603979776">RESULTS</note>
+    <monitor x="10" precision="3" y="426" height="45" fontSize="11" display="brand share now" width="205" sizeVersion="0">current-brand-share</monitor>
+    <monitor x="225" precision="3" y="426" height="45" fontSize="11" display="persistence index" width="205" sizeVersion="0">persistence-index</monitor>
+    <monitor x="10" precision="3" y="476" height="45" fontSize="11" display="program lift" width="205" sizeVersion="0">program-lift</monitor>
+    <monitor x="225" precision="0" y="476" height="45" fontSize="11" display="ticks above baseline" width="205" sizeVersion="0">ticks-above-baseline</monitor>
+    <monitor x="10" precision="3" y="526" height="45" fontSize="11" display="mean intrinsic motivation" width="205" sizeVersion="0">mean-motivation</monitor>
+    <monitor x="225" precision="3" y="526" height="45" fontSize="11" display="mean network degree" width="205" sizeVersion="0">mean-network-degree</monitor>
+    <note x="10" y="576" backgroundDark="603979776" fontSize="11" width="420" markdown="false" height="90" textColorDark="-1" textColorLight="-16777216" backgroundLight="603979776">There is no control group inside a run: with talk switched on, an untreated neighbour still hears the treated ones. Baselines are OTHER RUNS. The schedule has the same length whether program-on? is true or false, so the four cells of the factorial stay comparable.</note>
+    <note x="440" y="262" backgroundDark="603979776" fontSize="11" width="245" markdown="false" height="80" textColorDark="-1" textColorLight="-16777216" backgroundLight="603979776">Each dot is a shopper. X = intrinsic motivation, Y = habit. Green recommends now, red advises against, grey is silent. Big dot = bought the brand this tick.</note>
+    <plot x="440" autoPlotX="false" yMax="10.0" autoPlotY="true" y="350" xMin="0.0" height="200" legend="false" xMax="1.0" yMin="0.0" display="Habit distribution" width="245" sizeVersion="0">
+      <setup>set-plot-x-range 0 1</setup>
+      <update></update>
+      <pen interval="0.025" mode="1" display="habit" color="-13345367" legend="true">
+        <setup></setup>
+        <update>plot-pen-reset
+set-histogram-num-bars 40
+histogram [habit] of shoppers</update>
+      </pen>
+    </plot>
+    <plot x="440" autoPlotX="true" yMax="1.0" autoPlotY="false" y="556" xMin="0.0" height="180" legend="false" xMax="250.0" yMin="-1.0" display="Mean satisfaction" width="245" sizeVersion="0">
+      <setup></setup>
+      <update></update>
+      <pen interval="1.0" mode="0" display="satisfaction" color="-955883" legend="true">
+        <setup></setup>
+        <update>plotxy ticks mean-satisfaction</update>
+      </pen>
+      <pen interval="1.0" mode="0" display="zero" color="-7500403" legend="true">
+        <setup></setup>
+        <update>plotxy ticks 0</update>
+      </pen>
+    </plot>
+    <plot x="695" autoPlotX="true" yMax="1.0" autoPlotY="false" y="10" xMin="0.0" height="240" legend="true" xMax="250.0" yMin="0.0" display="Brand choice share" width="440" sizeVersion="0">
+      <setup></setup>
+      <update></update>
+      <pen interval="1.0" mode="0" display="share now" color="-13345367" legend="true">
+        <setup></setup>
+        <update>plotxy ticks current-brand-share</update>
+      </pen>
+      <pen interval="1.0" mode="0" display="baseline level" color="-7500403" legend="true">
+        <setup></setup>
+        <update>plotxy ticks baseline-share-level</update>
+      </pen>
+    </plot>
+    <plot x="695" autoPlotX="true" yMax="1.0" autoPlotY="false" y="256" xMin="0.0" height="240" legend="true" xMax="250.0" yMin="0.0" display="Habit and intrinsic motivation" width="440" sizeVersion="0">
+      <setup></setup>
+      <update></update>
+      <pen interval="1.0" mode="0" display="mean habit" color="-2674135" legend="true">
+        <setup></setup>
+        <update>plotxy ticks mean-habit</update>
+      </pen>
+      <pen interval="1.0" mode="0" display="mean motivation" color="-15575016" legend="true">
+        <setup></setup>
+        <update>plotxy ticks mean-motivation</update>
+      </pen>
+      <pen interval="1.0" mode="0" display="baseline habit" color="-7500403" legend="true">
+        <setup></setup>
+        <update>plotxy ticks baseline-habit-level</update>
+      </pen>
+    </plot>
+    <plot x="695" autoPlotX="true" yMax="1.0" autoPlotY="false" y="502" xMin="0.0" height="234" legend="true" xMax="250.0" yMin="0.0" display="Who is talking, and who hears it" width="440" sizeVersion="0">
+      <setup></setup>
+      <update></update>
+      <pen interval="1.0" mode="0" display="recommending" color="-13840069" legend="true">
+        <setup></setup>
+        <update>plotxy ticks share-recommending</update>
+      </pen>
+      <pen interval="1.0" mode="0" display="advising against" color="-2674135" legend="true">
+        <setup></setup>
+        <update>plotxy ticks share-advising-against</update>
+      </pen>
+      <pen interval="1.0" mode="0" display="reached by a signal" color="-8630108" legend="true">
+        <setup></setup>
+        <update>plotxy ticks share-reached</update>
+      </pen>
+    </plot>
+  </widgets>
+  <info><![CDATA[# Програма лояльності і мережа, яка про неї говорить
+
+Агентна модель. NetLogo 7, розширення `nw`. Версія v1 (нова кодова база,
+не є продовженням `reward-habits-opinion-network-HK-*`).
+
+## 1. Питання
+
+Програма лояльності винагороджує покупців, а винагороджені покупці про це
+розповідають. Word of mouth несе цей досвід соціальними зв'язками. Модель
+питає три речі:
+
+1. **Amplification.** Чи підсилює розмова ефект програми, поки програма діє?
+2. **Persistence.** Чи тримає розмова звичку вище baseline після скасування
+   програми — чи, навпаки, розносить розчарування і пришвидшує обвал?
+3. **Substitution.** Винагорода і розмова — це взаємозамінні канали утримання
+   чи взаємодоповнювальні?
+
+Модель призначена для порівняння сценаріїв політики, а не для прогнозування
+абсолютних чисел. Значення параметрів не калібровані на емпіричних даних.
+
+## 2. Явища, які модель має відтворювати
+
+Це критерій справності. Якщо якесь із чотирьох явищ зникає після зміни коду,
+зміна помилкова.
+
+1. **Підйом під час кампанії.** `program-lift` помітно більший за нуль при
+   `program-on? = true`.
+2. **Crowding out.** При `reward-salience` вище `salience-threshold` (0.60)
+   `motivation-loss` додатний і зростає разом із помітністю винагороди.
+   При `reward-salience` нижче порога `motivation-loss` від'ємний.
+3. **Післяпрограмне розчарування.** Одразу після завершення останньої
+   кампанії `mean-satisfaction` пірнає в мінус, а `share-advising-against`
+   стрибає вгору, після чого обидва повільно повертаються. Це не артефакт:
+   див. адаптивну точку відліку в розділі 5.
+4. **Незбіг рівня і тривалості.** `persistence-index` і `ticks-above-baseline`
+   можуть розходитися: розмова здатна підняти середній післяпрограмний рівень,
+   але скоротити час утримання, і навпаки. Якщо ці два показники завжди
+   рухаються разом, механізм розмови зламано.
+
+## 3. Сутності та змінні стану
+
+Єдина порода агентів — `shoppers`, ребра `links` утворюють соціальну мережу.
+Патчі не використовуються: координати агента мають лише візуальний зміст
+(X = внутрішня мотивація, Y = звичка).
+
+Стан покупця:
+
+| змінна | діапазон | зміст |
+|---|---|---|
+| `intrinsic-motivation` | [0;1] | внутрішня цінність бренду, динамічний стан |
+| `habit` | [0;1] | частка покупок бренду в останніх 20 можливостях |
+| `recent-choices` | список 0/1 | вікно поведінкової пам'яті |
+| `satisfaction` | [-1;1] | накопичена оцінка останніх покупок |
+| `reference-level` | ~[-1;1] | до чого агент звик |
+| `stance` | {-1,0,1} | що агент говорить цього тіку |
+| `perceived-signal` | {-1,0,1} | що агент почув цього тіку |
+
+Сталі індивідуальні риси, згенеровані в `setup` з обрізаних нормальних
+розподілів: `price-sensitivity`, `habit-sensitivity`, `reward-sensitivity`,
+`autonomy-sensitivity`. Через UI вони не задаються.
+
+## 4. Розклад
+
+    baseline (50) | [campaign (40) + pause (20)] x (reward-cycles - 1) | campaign (40) | final (100)
+
+Програма **завершується кампанією, а не паузою**. Інакше `final`-фаза
+починалася б після паузи, під час якої звичка вже встигла обвалитися, і
+вимірювання тривалості утримання втратило б сенс.
+
+`program-on? = false` **не скорочує прогон**. Фази ті самі, просто під час
+`campaign` не нараховується винагорода. Це умова коректності факторіалу:
+всі чотири клітинки `program x wom` мають однакову довжину прогону, однакові
+вікна метрик і однакову кількість тіків, протягом яких працює розмова.
+
+Тривалості фаз — константи в `initialize-constants`, а не слайдери.
+
+## 5. Один тік
+
+Тік розділений на три послідовні проходи по популяції. Це модельне
+припущення, а не деталь реалізації: злиття проходів в один `ask` зробило б
+результат залежним від випадкового порядку агентів усередині `ask`.
+
+1. **Хто говорить.** Агент говорить, якщо йому є що сказати
+   (`abs satisfaction > talk-margin`, 0.40) і випав його тік (імовірність
+   `talk-activity`). Знак висловлювання — знак `satisfaction`. Задоволені
+   рекомендують, розчаровані відмовляють; обидва напрями симетричні
+   (Berger, 2014).
+2. **Хто що чує.** Кожен агент читає `stance` сусідів. Правило зараження:
+   - `simple` — досить одного голосу в певний бік (інформаційний маршрут:
+     Deutsch & Gerard, 1955; Centola & Macy, 2007);
+   - `threshold` — голоси рахуються, лише коли їх частка серед **усіх**
+     сусідів перевищує `adoption-threshold` (Granovetter, 1978; Watts, 2002).
+   Обидва правила повертають значення в {-1,0,1}: зустрічні потоки гасять
+   один одного, тому змішане коло дає нуль.
+3. **Вибір і оновлення стану.**
+
+### Правило вибору
+
+    U_i = m_i + s^h_i h_i + s^r_i r + w g_i - s^p_i c
+    P(бренд) = logistic(beta * U_i)
+
+`m` — внутрішня мотивація (вага жорстко 1), `h` — звичка, `r` —
+`active-reward-salience`, `g` — почутий сигнал, `w` — `talk-strength`,
+`c` — `brand-price-premium` (1.70), `beta` — `choice-sharpness` (1.50).
+Соціальний доданок асимілятивний (Flache et al., 2017).
+
+**Ідентифікованість.** `beta` множить усю `U`, тому спільне масштабування
+всіх ваг дає ту саму модель. При калібруванні фіксуйте `beta`.
+
+### Звичка
+
+Ковзна частка покупок бренду у вікні з 20 останніх можливостей. Формується
+виключно повторенням, тому окремі `habit-learning-rate` і `habit-decay-rate`
+не потрібні — обидва задані довжиною вікна.
+
+### Crowding out
+
+    signal = G * r * (theta - r) / W
+
+`r` — фактично нарахована винагорода, `theta` = 0.60, `G` = 4, `W` = 20.
+Помірний бонус (`r < theta`) підтверджує цінність поведінки, надмірний
+(`r > theta`) сприймається як зовнішній контроль. Підкріплення множиться на
+`(1 - m)`, витіснення — на `m` і на індивідуальну `autonomy-sensitivity`,
+тому обидва процеси насичуються біля меж [0;1].
+
+Множник `r` у чисельнику істотний. Без нього нульова винагорода дала б
+**найбільше** позитивне підкріплення (`theta - 0 = theta`), тобто відсутність
+стимулу максимально зміцнювала б мотивацію. Тут `signal(0) = 0`.
+
+Мотивація змінюється лише коли винагорода активна І агент справді купив
+бренд. Механізму самостійного відновлення мотивації немає: витіснення
+незворотне в межах прогону. Це свідоме обмеження, див. розділ 9.
+
+### Досвід і розчарування
+
+`satisfaction` вимірює не абсолютну якість покупки, а відхилення від того,
+до чого агент **звик**:
+
+    experience     = brand-experience (+ бонус)  або  rival-experience
+    reference     <- reference + 0.05 * (experience - reference)
+    evaluation     = 2 * (experience - reference)
+    satisfaction  <- satisfaction + 0.25 * (evaluation + шум - satisfaction)
+
+Два калібрувальні рішення тут неочевидні й важливі.
+
+**Оцінка центрована** (`baseline-liking = 0`). Будь-який постійний
+позитивний зсув дає систематичний нахил, який через опуклість логістичної
+функції у нижній зоні і зворотний зв'язок «звичка -> вибір -> звичка»
+розганяється в лавину: ринок насичується сам собою, без жодної програми.
+
+**`talk-margin` = 0.40, а не 0.10.** У стаціонарному стані `satisfaction`
+коливається зі стандартним відхиленням близько 0.14, тому за низького порога
+чверть популяції говорить щотіку просто через шум вибору. Розмова тоді
+насичує ринок ще під час baseline, і порівняння wom off / wom on
+вироджується в порівняння двох стель. За порога 0.40 у рівновазі майже ніхто
+не говорить: розмову породжують **зміни** — старт кампанії і її скасування.
+
+Саме звідси береться післяпрограмне розчарування. Під час кампанії точка
+відліку піднімається до рівня «покупка плюс бонус». Коли програму скасовано,
+той самий товар без бонусу опиняється нижче звичного рівня, `satisfaction`
+падає в мінус, і мережею йде хвиля негативних відгуків. Без адаптивного
+відліку скасування давало б лише повернення до помірно позитивної оцінки, і
+механізму розчарування не існувало б узагалі.
+
+## 6. Чому всередині запуску немає control-групи
+
+При увімкненому WoM «контрольний» агент чує сусідів, які отримують бонуси,
+тому він не є контролем — він отримує ефект програми через мережу. Модель
+тому має одну однорідну популяцію, а **всі порівняння відбуваються між
+запусками**: `program-on?` і `wom-on?` є факторами BehaviorSpace.
+
+Практичний наслідок: потрібні повторення і по змозі спарені зерна.
+У всіх експериментах `setup` починається з `random-seed behaviorspace-run-number`.
+Повного спарювання це не дає (різні параметри розводять потік ГВЧ), але
+зменшує розкид між клітинками.
+
+## 7. Параметри інтерфейсу
+
+**PROGRAM**
+
+- `number-of-shoppers` — розмір популяції; більше значення зменшує шум
+  агрегатів і збільшує час роботи.
+- `reward-cycles` — кількість кампаній.
+- `program-on?` — чи нараховується винагорода взагалі. Вимикач сценарію,
+  не розкладу.
+- `reward-salience` — психологічна помітність бонусу, а не його сума.
+  Значення відносно 0.60 визначає **знак** ефекту на внутрішню мотивацію.
+
+**TALK**
+
+- `wom-on?` — існування каналу word of mouth.
+- `talk-activity` — імовірність, що агент, якому є що сказати, справді
+  висловиться на цьому тіку. Відокремлює наявність думки від акту її
+  висловлення.
+- `contagion-rule` — `simple` або `threshold`.
+- `adoption-threshold` — критична частка сусідів для `threshold`. Для
+  `simple` не має ефекту.
+- `talk-strength` — вага почутого сигналу в корисності вибору.
+
+**NETWORK**
+
+- `network-topology` — `small-world` (Watts–Strogatz) або
+  `preferential-attachment` (Barabási–Albert). Обидва генератори налаштовані
+  на однаковий цільовий середній степінь 8, тому топології порівнянні за
+  щільністю і відрізняються саме структурою.
+- `rewiring-probability` — частка перепідключених ребер; діє лише для
+  `small-world`.
+
+Решта — константи в `initialize-constants`. Вони визначають масштаб моделі,
+а не сценарій політики, і тому свідомо не виведені в UI. Три з них суттєво впливають на висновки: `salience-threshold` (0.60) задає
+знак ефекту винагороди на мотивацію, `reference-adapt` (0.05) — глибину
+післяпрограмного розчарування, `talk-margin` (0.40) — чи є розмова реакцією
+на новину чи постійним фоном. Будь-який висновок варто супроводжувати перевіркою чутливості
+до них.
+
+## 8. Метрики
+
+Рівні за фазами: `brand-share "baseline"`, `"campaign"`, `"pause"`, `"final"`.
+
+- `program-lift` = campaign − baseline. Підйом програми в межах запуску.
+- `persistence-index` = final − baseline. Більше нуля — залишок є.
+- `retention-ratio` = final / campaign.
+- `withdrawal-drop` = campaign − final.
+- `ticks-above-baseline` — скільки тіків final-фази середня звичка
+  трималася вище baseline-рівня.
+- `ticks-to-collapse` — перший тік final-фази, коли вона опустилася;
+  дорівнює `final-duration`, якщо не опустилася.
+- `motivation-loss` — втрата внутрішньої мотивації відносно старту;
+  додатне значення означає crowding out.
+- `share-recommending`, `share-advising-against` — хто говорить зараз.
+- `share-satisfied`, `share-dissatisfied` — кому є що сказати, незалежно
+  від `talk-activity`; стабільніші показники.
+- `share-reached` — частка агентів, які отримали ненульовий сигнал. Показує,
+  чи канал узагалі працює при заданому `adoption-threshold`.
+
+`ticks-above-baseline` та `ticks-to-collapse` порівнюють **звичку**, а не
+миттєву частку покупок: звичка вже є ковзним середнім за 20 тіків, тому не
+потребує згладжування і не породжує хибних перетинів через шум вибірки.
+
+## 9. Обмеження
+
+- Мережа статична в межах запуску: зв'язки не рвуться і не утворюються.
+- Внутрішня мотивація не відновлюється самостійно; витіснення незворотне.
+- Ціна бренду постійна; конкурент не реагує на програму.
+- Сигнал розмови дискретний ({-1,0,1}), тому інтенсивність думки не
+  передається — передається лише її напрям.
+- Немає прямої передачі поведінки (imitation): передається оцінка, а не дія.
+- Порівняння між запусками чутливі до кількості повторень; для 800 агентів
+  стандартна похибка частки близько 0.017 за тік, тому різниці менші за
+  0.02 без достатніх повторень не інтерпретуються.
+
+## 10. Експерименти BehaviorSpace
+
+- **E1 amplification** — `wom-on?` false/true при `program-on? = true`.
+  Читати `program-lift`. Різниця середніх між wom off і wom on і є відповідь.
+- **E2 persistence** — той самий дизайн, але читати `persistence-index`
+  (рівень) РАЗОМ із `ticks-above-baseline` і `ticks-to-collapse` (тривалість),
+  а також `share-advising-against` для механізму розчарування.
+- **E2b persistence trajectory** — те саме з `runMetricsEveryStep`, щоб
+  побудувати криві обвалу.
+- **E3 substitution** — факторіал `program-on?` x `wom-on?`. Взаємодія:
+  (on,on) − (on,off) − (off,on) + (off,off) на `persistence-index`.
+  Від'ємна взаємодія = канали є замінниками, додатна = доповнювачами.
+- **S1 network sensitivity** — топологія, перепідключення, активність.
+- **S2 crowding out** — свіп `reward-salience` через поріг 0.60.
+- **regression test** — швидка перевірка, що всі комбінації запускаються.
+
+Свіпи, спільні для E1–E3: правило зараження, `adoption-threshold`,
+`rewiring-probability`, `talk-strength`.
+
+Зауваження щодо обсягу: у клітинках із `wom-on? = false` параметри розмови
+не мають ефекту, тому такі запуски дублюються. Це навмисно — так дизайн
+лишається збалансованим. При аналізі їх можна згорнути.
+
+## 11. Еталонні результати
+
+Отримані на порті логіки моделі (800 покупців, `reward-cycles` 2,
+`reward-salience` 0.75, `talk-activity` 0.5, `talk-strength` 1.5,
+`contagion-rule` simple, small-world, `rewiring-probability` 0.1;
+середні за 10 повторень). Слугують регресійним орієнтиром: після зміни коду
+значення мають лишатися того самого порядку і того самого ЗНАКУ.
+
+| сценарій | baseline | campaign | final | lift | persistence-index | ticks above | motivation-loss |
+|---|---|---|---|---|---|---|---|
+| program off, wom off | 0.259 | 0.278 | 0.280 | 0.019 | 0.021 | 54 | 0.000 |
+| program off, wom on  | 0.261 | 0.278 | 0.279 | 0.017 | 0.018 | 34 | 0.000 |
+| program on,  wom off | 0.259 | 0.685 | 0.223 | 0.426 | -0.036 | 26 | 0.220 |
+| program on,  wom on  | 0.261 | 0.818 | 0.146 | 0.557 | -0.115 | 16 | 0.251 |
+
+Що з цього читається:
+
+1. **Amplification: так, помітно.** Розмова піднімає `program-lift`
+   з 0.43 до 0.56, тобто приблизно на 13 процентних пунктів, або на третину
+   від ефекту самої програми. Правило `threshold` дає слабший підйом (0.53),
+   бо частина сигналів не долає поріг.
+2. **Persistence: розмова робить гірше, а не краще.** `persistence-index`
+   падає з -0.036 до -0.115, а час утримання звички вище baseline
+   скорочується з 26 до 16 тіків. Механізм видно на графіку розмови:
+   одразу після скасування `share-advising-against` стрибає вгору. Мережа
+   розносить розчарування швидше, ніж утримує звичку.
+3. **Substitution: канали не є замінниками.** Взаємодія на
+   `persistence-index` дорівнює -0.076, тобто ефекти суб'адитивні. Але
+   головне інше: без програми розмова не робить нічого
+   (0.279 проти 0.280). У цій моделі word of mouth — чистий підсилювач,
+   у нього немає власного каналу утримання, тому замінити програму він
+   не може в принципі.
+4. **Crowding out** перемикає знак рівно на порозі: при `reward-salience`
+   0.2-0.4 `motivation-loss` від'ємний і `persistence-index` додатний
+   (+0.13...+0.17), при 0.8-0.95 — навпаки (-0.06...-0.15).
+
+Чутливість, яку варто знати заздалегідь: `talk-activity` має ефект лише
+в нижній частині діапазону (0.1 проти 0.5 дає lift 0.49 проти 0.56, далі
+насичення); `rewiring-probability` майже не впливає (0.55 проти 0.53 на
+всьому діапазоні 0-1). Останнє — змістовний негативний результат, а не
+поломка: сигнал тут не є каскадом, який шукає короткі шляхи, а
+загальнопопуляційною хвилею, синхронізованою розкладом програми.
+
+## 12. Джерела
+
+- Belli та ін. (2022) — мета-аналітичні свідчення, що програми лояльності
+  зсувають лояльність.
+- Berger (2014) — word of mouth як цілеспрямована дія.
+- Alvarado-Valencia та Silva (2018) — незадоволені клієнти теж говорять.
+- Deutsch та Gerard (1955); Cialdini та Goldstein (2004) — інформаційний
+  та нормативний маршрути впливу.
+- Granovetter (1978); Watts (2002); Centola та Macy (2007) — порогові моделі
+  і проста проти складної контагії.
+- Watts та Strogatz (1998) — small-world топологія.
+- Flache та ін. (2017) — асимілятивний соціальний вплив у правилі вибору.
+- Baxter, Collings та Adjali (2003); England, Owadally та Wright (2022) —
+  найближчі агентні прецеденти.
+- Deci, Koestner та Ryan (1999) — витіснення внутрішньої мотивації.
+]]></info>
+  <turtleShapes>
+    <shape name="default" rotatable="true" editableColorIndex="0">
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="150" y="5"></point>
+        <point x="40" y="250"></point>
+        <point x="150" y="205"></point>
+        <point x="260" y="250"></point>
+      </polygon>
+    </shape>
+    <shape name="airplane" rotatable="true" editableColorIndex="0">
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="150" y="0"></point>
+        <point x="135" y="15"></point>
+        <point x="120" y="60"></point>
+        <point x="120" y="105"></point>
+        <point x="15" y="165"></point>
+        <point x="15" y="195"></point>
+        <point x="120" y="180"></point>
+        <point x="135" y="240"></point>
+        <point x="105" y="270"></point>
+        <point x="120" y="285"></point>
+        <point x="150" y="270"></point>
+        <point x="180" y="285"></point>
+        <point x="210" y="270"></point>
+        <point x="165" y="240"></point>
+        <point x="180" y="180"></point>
+        <point x="285" y="195"></point>
+        <point x="285" y="165"></point>
+        <point x="180" y="105"></point>
+        <point x="180" y="60"></point>
+        <point x="165" y="15"></point>
+      </polygon>
+    </shape>
+    <shape name="arrow" rotatable="true" editableColorIndex="0">
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="150" y="0"></point>
+        <point x="0" y="150"></point>
+        <point x="105" y="150"></point>
+        <point x="105" y="293"></point>
+        <point x="195" y="293"></point>
+        <point x="195" y="150"></point>
+        <point x="300" y="150"></point>
+      </polygon>
+    </shape>
+    <shape name="box" rotatable="false" editableColorIndex="0">
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="150" y="285"></point>
+        <point x="285" y="225"></point>
+        <point x="285" y="75"></point>
+        <point x="150" y="135"></point>
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="150" y="135"></point>
+        <point x="15" y="75"></point>
+        <point x="150" y="15"></point>
+        <point x="285" y="75"></point>
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="15" y="75"></point>
+        <point x="15" y="225"></point>
+        <point x="150" y="285"></point>
+        <point x="150" y="135"></point>
+      </polygon>
+      <line endX="150" startY="285" marked="false" color="255" endY="135" startX="150"></line>
+      <line endX="15" startY="135" marked="false" color="255" endY="75" startX="150"></line>
+      <line endX="285" startY="135" marked="false" color="255" endY="75" startX="150"></line>
+    </shape>
+    <shape name="bug" rotatable="true" editableColorIndex="0">
+      <circle x="96" y="182" marked="true" color="-1920102913" diameter="108" filled="true"></circle>
+      <circle x="110" y="127" marked="true" color="-1920102913" diameter="80" filled="true"></circle>
+      <circle x="110" y="75" marked="true" color="-1920102913" diameter="80" filled="true"></circle>
+      <line endX="80" startY="100" marked="true" color="-1920102913" endY="30" startX="150"></line>
+      <line endX="220" startY="100" marked="true" color="-1920102913" endY="30" startX="150"></line>
+    </shape>
+    <shape name="butterfly" rotatable="true" editableColorIndex="0">
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="150" y="165"></point>
+        <point x="209" y="199"></point>
+        <point x="225" y="225"></point>
+        <point x="225" y="255"></point>
+        <point x="195" y="270"></point>
+        <point x="165" y="255"></point>
+        <point x="150" y="240"></point>
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="150" y="165"></point>
+        <point x="89" y="198"></point>
+        <point x="75" y="225"></point>
+        <point x="75" y="255"></point>
+        <point x="105" y="270"></point>
+        <point x="135" y="255"></point>
+        <point x="150" y="240"></point>
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="139" y="148"></point>
+        <point x="100" y="105"></point>
+        <point x="55" y="90"></point>
+        <point x="25" y="90"></point>
+        <point x="10" y="105"></point>
+        <point x="10" y="135"></point>
+        <point x="25" y="180"></point>
+        <point x="40" y="195"></point>
+        <point x="85" y="194"></point>
+        <point x="139" y="163"></point>
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="162" y="150"></point>
+        <point x="200" y="105"></point>
+        <point x="245" y="90"></point>
+        <point x="275" y="90"></point>
+        <point x="290" y="105"></point>
+        <point x="290" y="135"></point>
+        <point x="275" y="180"></point>
+        <point x="260" y="195"></point>
+        <point x="215" y="195"></point>
+        <point x="162" y="165"></point>
+      </polygon>
+      <polygon color="255" filled="true" marked="false">
+        <point x="150" y="255"></point>
+        <point x="135" y="225"></point>
+        <point x="120" y="150"></point>
+        <point x="135" y="120"></point>
+        <point x="150" y="105"></point>
+        <point x="165" y="120"></point>
+        <point x="180" y="150"></point>
+        <point x="165" y="225"></point>
+      </polygon>
+      <circle x="135" y="90" marked="false" color="255" diameter="30" filled="true"></circle>
+      <line endX="195" startY="105" marked="false" color="255" endY="60" startX="150"></line>
+      <line endX="105" startY="105" marked="false" color="255" endY="60" startX="150"></line>
+    </shape>
+    <shape name="car" rotatable="false" editableColorIndex="0">
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="300" y="180"></point>
+        <point x="279" y="164"></point>
+        <point x="261" y="144"></point>
+        <point x="240" y="135"></point>
+        <point x="226" y="132"></point>
+        <point x="213" y="106"></point>
+        <point x="203" y="84"></point>
+        <point x="185" y="63"></point>
+        <point x="159" y="50"></point>
+        <point x="135" y="50"></point>
+        <point x="75" y="60"></point>
+        <point x="0" y="150"></point>
+        <point x="0" y="165"></point>
+        <point x="0" y="225"></point>
+        <point x="300" y="225"></point>
+        <point x="300" y="180"></point>
+      </polygon>
+      <circle x="180" y="180" marked="false" color="255" diameter="90" filled="true"></circle>
+      <circle x="30" y="180" marked="false" color="255" diameter="90" filled="true"></circle>
+      <polygon color="255" filled="true" marked="false">
+        <point x="162" y="80"></point>
+        <point x="132" y="78"></point>
+        <point x="134" y="135"></point>
+        <point x="209" y="135"></point>
+        <point x="194" y="105"></point>
+        <point x="189" y="96"></point>
+        <point x="180" y="89"></point>
+      </polygon>
+      <circle x="47" y="195" marked="true" color="-1920102913" diameter="58" filled="true"></circle>
+      <circle x="195" y="195" marked="true" color="-1920102913" diameter="58" filled="true"></circle>
+    </shape>
+    <shape name="circle" rotatable="false" editableColorIndex="0">
+      <circle x="0" y="0" marked="true" color="-1920102913" diameter="300" filled="true"></circle>
+    </shape>
+    <shape name="circle 2" rotatable="false" editableColorIndex="0">
+      <circle x="0" y="0" marked="true" color="-1920102913" diameter="300" filled="true"></circle>
+      <circle x="30" y="30" marked="false" color="255" diameter="240" filled="true"></circle>
+    </shape>
+    <shape name="cow" rotatable="false" editableColorIndex="0">
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="200" y="193"></point>
+        <point x="197" y="249"></point>
+        <point x="179" y="249"></point>
+        <point x="177" y="196"></point>
+        <point x="166" y="187"></point>
+        <point x="140" y="189"></point>
+        <point x="93" y="191"></point>
+        <point x="78" y="179"></point>
+        <point x="72" y="211"></point>
+        <point x="49" y="209"></point>
+        <point x="48" y="181"></point>
+        <point x="37" y="149"></point>
+        <point x="25" y="120"></point>
+        <point x="25" y="89"></point>
+        <point x="45" y="72"></point>
+        <point x="103" y="84"></point>
+        <point x="179" y="75"></point>
+        <point x="198" y="76"></point>
+        <point x="252" y="64"></point>
+        <point x="272" y="81"></point>
+        <point x="293" y="103"></point>
+        <point x="285" y="121"></point>
+        <point x="255" y="121"></point>
+        <point x="242" y="118"></point>
+        <point x="224" y="167"></point>
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="73" y="210"></point>
+        <point x="86" y="251"></point>
+        <point x="62" y="249"></point>
+        <point x="48" y="208"></point>
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="25" y="114"></point>
+        <point x="16" y="195"></point>
+        <point x="9" y="204"></point>
+        <point x="23" y="213"></point>
+        <point x="25" y="200"></point>
+        <point x="39" y="123"></point>
+      </polygon>
+    </shape>
+    <shape name="cylinder" rotatable="false" editableColorIndex="0">
+      <circle x="0" y="0" marked="true" color="-1920102913" diameter="300" filled="true"></circle>
+    </shape>
+    <shape name="dot" rotatable="false" editableColorIndex="0">
+      <circle x="90" y="90" marked="true" color="-1920102913" diameter="120" filled="true"></circle>
+    </shape>
+    <shape name="face happy" rotatable="false" editableColorIndex="0">
+      <circle x="8" y="8" marked="true" color="-1920102913" diameter="285" filled="true"></circle>
+      <circle x="60" y="75" marked="false" color="255" diameter="60" filled="true"></circle>
+      <circle x="180" y="75" marked="false" color="255" diameter="60" filled="true"></circle>
+      <polygon color="255" filled="true" marked="false">
+        <point x="150" y="255"></point>
+        <point x="90" y="239"></point>
+        <point x="62" y="213"></point>
+        <point x="47" y="191"></point>
+        <point x="67" y="179"></point>
+        <point x="90" y="203"></point>
+        <point x="109" y="218"></point>
+        <point x="150" y="225"></point>
+        <point x="192" y="218"></point>
+        <point x="210" y="203"></point>
+        <point x="227" y="181"></point>
+        <point x="251" y="194"></point>
+        <point x="236" y="217"></point>
+        <point x="212" y="240"></point>
+      </polygon>
+    </shape>
+    <shape name="face neutral" rotatable="false" editableColorIndex="0">
+      <circle x="8" y="7" marked="true" color="-1920102913" diameter="285" filled="true"></circle>
+      <circle x="60" y="75" marked="false" color="255" diameter="60" filled="true"></circle>
+      <circle x="180" y="75" marked="false" color="255" diameter="60" filled="true"></circle>
+      <rectangle endX="240" startY="195" marked="false" color="255" endY="225" startX="60" filled="true"></rectangle>
+    </shape>
+    <shape name="face sad" rotatable="false" editableColorIndex="0">
+      <circle x="8" y="8" marked="true" color="-1920102913" diameter="285" filled="true"></circle>
+      <circle x="60" y="75" marked="false" color="255" diameter="60" filled="true"></circle>
+      <circle x="180" y="75" marked="false" color="255" diameter="60" filled="true"></circle>
+      <polygon color="255" filled="true" marked="false">
+        <point x="150" y="168"></point>
+        <point x="90" y="184"></point>
+        <point x="62" y="210"></point>
+        <point x="47" y="232"></point>
+        <point x="67" y="244"></point>
+        <point x="90" y="220"></point>
+        <point x="109" y="205"></point>
+        <point x="150" y="198"></point>
+        <point x="192" y="205"></point>
+        <point x="210" y="220"></point>
+        <point x="227" y="242"></point>
+        <point x="251" y="229"></point>
+        <point x="236" y="206"></point>
+        <point x="212" y="183"></point>
+      </polygon>
+    </shape>
+    <shape name="fish" rotatable="false" editableColorIndex="0">
+      <polygon color="-1" filled="true" marked="false">
+        <point x="44" y="131"></point>
+        <point x="21" y="87"></point>
+        <point x="15" y="86"></point>
+        <point x="0" y="120"></point>
+        <point x="15" y="150"></point>
+        <point x="0" y="180"></point>
+        <point x="13" y="214"></point>
+        <point x="20" y="212"></point>
+        <point x="45" y="166"></point>
+      </polygon>
+      <polygon color="-1" filled="true" marked="false">
+        <point x="135" y="195"></point>
+        <point x="119" y="235"></point>
+        <point x="95" y="218"></point>
+        <point x="76" y="210"></point>
+        <point x="46" y="204"></point>
+        <point x="60" y="165"></point>
+      </polygon>
+      <polygon color="-1" filled="true" marked="false">
+        <point x="75" y="45"></point>
+        <point x="83" y="77"></point>
+        <point x="71" y="103"></point>
+        <point x="86" y="114"></point>
+        <point x="166" y="78"></point>
+        <point x="135" y="60"></point>
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="30" y="136"></point>
+        <point x="151" y="77"></point>
+        <point x="226" y="81"></point>
+        <point x="280" y="119"></point>
+        <point x="292" y="146"></point>
+        <point x="292" y="160"></point>
+        <point x="287" y="170"></point>
+        <point x="270" y="195"></point>
+        <point x="195" y="210"></point>
+        <point x="151" y="212"></point>
+        <point x="30" y="166"></point>
+      </polygon>
+      <circle x="215" y="106" marked="false" color="255" diameter="30" filled="true"></circle>
+    </shape>
+    <shape name="flag" rotatable="false" editableColorIndex="0">
+      <rectangle endX="75" startY="15" marked="true" color="-1920102913" endY="300" startX="60" filled="true"></rectangle>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="90" y="150"></point>
+        <point x="270" y="90"></point>
+        <point x="90" y="30"></point>
+      </polygon>
+      <line endX="90" startY="135" marked="true" color="-1920102913" endY="135" startX="75"></line>
+      <line endX="90" startY="45" marked="true" color="-1920102913" endY="45" startX="75"></line>
+    </shape>
+    <shape name="flower" rotatable="false" editableColorIndex="0">
+      <polygon color="1504722175" filled="true" marked="false">
+        <point x="135" y="120"></point>
+        <point x="165" y="165"></point>
+        <point x="180" y="210"></point>
+        <point x="180" y="240"></point>
+        <point x="150" y="300"></point>
+        <point x="165" y="300"></point>
+        <point x="195" y="240"></point>
+        <point x="195" y="195"></point>
+        <point x="165" y="135"></point>
+      </polygon>
+      <circle x="85" y="132" marked="true" color="-1920102913" diameter="38" filled="true"></circle>
+      <circle x="130" y="147" marked="true" color="-1920102913" diameter="38" filled="true"></circle>
+      <circle x="192" y="85" marked="true" color="-1920102913" diameter="38" filled="true"></circle>
+      <circle x="85" y="40" marked="true" color="-1920102913" diameter="38" filled="true"></circle>
+      <circle x="177" y="40" marked="true" color="-1920102913" diameter="38" filled="true"></circle>
+      <circle x="177" y="132" marked="true" color="-1920102913" diameter="38" filled="true"></circle>
+      <circle x="70" y="85" marked="true" color="-1920102913" diameter="38" filled="true"></circle>
+      <circle x="130" y="25" marked="true" color="-1920102913" diameter="38" filled="true"></circle>
+      <circle x="96" y="51" marked="true" color="-1920102913" diameter="108" filled="true"></circle>
+      <circle x="113" y="68" marked="false" color="255" diameter="74" filled="true"></circle>
+      <polygon color="1504722175" filled="true" marked="false">
+        <point x="189" y="233"></point>
+        <point x="219" y="188"></point>
+        <point x="249" y="173"></point>
+        <point x="279" y="188"></point>
+        <point x="234" y="218"></point>
+      </polygon>
+      <polygon color="1504722175" filled="true" marked="false">
+        <point x="180" y="255"></point>
+        <point x="150" y="210"></point>
+        <point x="105" y="210"></point>
+        <point x="75" y="240"></point>
+        <point x="135" y="240"></point>
+      </polygon>
+    </shape>
+    <shape name="house" rotatable="false" editableColorIndex="0">
+      <rectangle endX="255" startY="120" marked="true" color="-1920102913" endY="285" startX="45" filled="true"></rectangle>
+      <rectangle endX="180" startY="210" marked="false" color="255" endY="285" startX="120" filled="true"></rectangle>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="15" y="120"></point>
+        <point x="150" y="15"></point>
+        <point x="285" y="120"></point>
+      </polygon>
+      <line endX="270" startY="120" marked="false" color="255" endY="120" startX="30"></line>
+    </shape>
+    <shape name="leaf" rotatable="false" editableColorIndex="0">
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="150" y="210"></point>
+        <point x="135" y="195"></point>
+        <point x="120" y="210"></point>
+        <point x="60" y="210"></point>
+        <point x="30" y="195"></point>
+        <point x="60" y="180"></point>
+        <point x="60" y="165"></point>
+        <point x="15" y="135"></point>
+        <point x="30" y="120"></point>
+        <point x="15" y="105"></point>
+        <point x="40" y="104"></point>
+        <point x="45" y="90"></point>
+        <point x="60" y="90"></point>
+        <point x="90" y="105"></point>
+        <point x="105" y="120"></point>
+        <point x="120" y="120"></point>
+        <point x="105" y="60"></point>
+        <point x="120" y="60"></point>
+        <point x="135" y="30"></point>
+        <point x="150" y="15"></point>
+        <point x="165" y="30"></point>
+        <point x="180" y="60"></point>
+        <point x="195" y="60"></point>
+        <point x="180" y="120"></point>
+        <point x="195" y="120"></point>
+        <point x="210" y="105"></point>
+        <point x="240" y="90"></point>
+        <point x="255" y="90"></point>
+        <point x="263" y="104"></point>
+        <point x="285" y="105"></point>
+        <point x="270" y="120"></point>
+        <point x="285" y="135"></point>
+        <point x="240" y="165"></point>
+        <point x="240" y="180"></point>
+        <point x="270" y="195"></point>
+        <point x="240" y="210"></point>
+        <point x="180" y="210"></point>
+        <point x="165" y="195"></point>
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="135" y="195"></point>
+        <point x="135" y="240"></point>
+        <point x="120" y="255"></point>
+        <point x="105" y="255"></point>
+        <point x="105" y="285"></point>
+        <point x="135" y="285"></point>
+        <point x="165" y="240"></point>
+        <point x="165" y="195"></point>
+      </polygon>
+    </shape>
+    <shape name="line" rotatable="true" editableColorIndex="0">
+      <line endX="150" startY="0" marked="true" color="-1920102913" endY="300" startX="150"></line>
+    </shape>
+    <shape name="line half" rotatable="true" editableColorIndex="0">
+      <line endX="150" startY="0" marked="true" color="-1920102913" endY="150" startX="150"></line>
+    </shape>
+    <shape name="pentagon" rotatable="false" editableColorIndex="0">
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="150" y="15"></point>
+        <point x="15" y="120"></point>
+        <point x="60" y="285"></point>
+        <point x="240" y="285"></point>
+        <point x="285" y="120"></point>
+      </polygon>
+    </shape>
+    <shape name="person" rotatable="false" editableColorIndex="0">
+      <circle x="110" y="5" marked="true" color="-1920102913" diameter="80" filled="true"></circle>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="105" y="90"></point>
+        <point x="120" y="195"></point>
+        <point x="90" y="285"></point>
+        <point x="105" y="300"></point>
+        <point x="135" y="300"></point>
+        <point x="150" y="225"></point>
+        <point x="165" y="300"></point>
+        <point x="195" y="300"></point>
+        <point x="210" y="285"></point>
+        <point x="180" y="195"></point>
+        <point x="195" y="90"></point>
+      </polygon>
+      <rectangle endX="172" startY="79" marked="true" color="-1920102913" endY="94" startX="127" filled="true"></rectangle>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="195" y="90"></point>
+        <point x="240" y="150"></point>
+        <point x="225" y="180"></point>
+        <point x="165" y="105"></point>
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="105" y="90"></point>
+        <point x="60" y="150"></point>
+        <point x="75" y="180"></point>
+        <point x="135" y="105"></point>
+      </polygon>
+    </shape>
+    <shape name="plant" rotatable="false" editableColorIndex="0">
+      <rectangle endX="165" startY="90" marked="true" color="-1920102913" endY="300" startX="135" filled="true"></rectangle>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="135" y="255"></point>
+        <point x="90" y="210"></point>
+        <point x="45" y="195"></point>
+        <point x="75" y="255"></point>
+        <point x="135" y="285"></point>
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="165" y="255"></point>
+        <point x="210" y="210"></point>
+        <point x="255" y="195"></point>
+        <point x="225" y="255"></point>
+        <point x="165" y="285"></point>
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="135" y="180"></point>
+        <point x="90" y="135"></point>
+        <point x="45" y="120"></point>
+        <point x="75" y="180"></point>
+        <point x="135" y="210"></point>
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="165" y="180"></point>
+        <point x="165" y="210"></point>
+        <point x="225" y="180"></point>
+        <point x="255" y="120"></point>
+        <point x="210" y="135"></point>
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="135" y="105"></point>
+        <point x="90" y="60"></point>
+        <point x="45" y="45"></point>
+        <point x="75" y="105"></point>
+        <point x="135" y="135"></point>
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="165" y="105"></point>
+        <point x="165" y="135"></point>
+        <point x="225" y="105"></point>
+        <point x="255" y="45"></point>
+        <point x="210" y="60"></point>
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="135" y="90"></point>
+        <point x="120" y="45"></point>
+        <point x="150" y="15"></point>
+        <point x="180" y="45"></point>
+        <point x="165" y="90"></point>
+      </polygon>
+    </shape>
+    <shape name="sheep" rotatable="false" editableColorIndex="15">
+      <circle x="203" y="65" marked="true" color="-1" diameter="88" filled="true"></circle>
+      <circle x="70" y="65" marked="true" color="-1" diameter="162" filled="true"></circle>
+      <circle x="150" y="105" marked="true" color="-1" diameter="120" filled="true"></circle>
+      <polygon color="-1920102913" filled="true" marked="false">
+        <point x="218" y="120"></point>
+        <point x="240" y="165"></point>
+        <point x="255" y="165"></point>
+        <point x="278" y="120"></point>
+      </polygon>
+      <circle x="214" y="72" marked="false" color="-1920102913" diameter="67" filled="true"></circle>
+      <rectangle endX="179" startY="223" marked="true" color="-1" endY="298" startX="164" filled="true"></rectangle>
+      <polygon color="-1" filled="true" marked="true">
+        <point x="45" y="285"></point>
+        <point x="30" y="285"></point>
+        <point x="30" y="240"></point>
+        <point x="15" y="195"></point>
+        <point x="45" y="210"></point>
+      </polygon>
+      <circle x="3" y="83" marked="true" color="-1" diameter="150" filled="true"></circle>
+      <rectangle endX="80" startY="221" marked="true" color="-1" endY="296" startX="65" filled="true"></rectangle>
+      <polygon color="-1" filled="true" marked="true">
+        <point x="195" y="285"></point>
+        <point x="210" y="285"></point>
+        <point x="210" y="240"></point>
+        <point x="240" y="210"></point>
+        <point x="195" y="210"></point>
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="false">
+        <point x="276" y="85"></point>
+        <point x="285" y="105"></point>
+        <point x="302" y="99"></point>
+        <point x="294" y="83"></point>
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="false">
+        <point x="219" y="85"></point>
+        <point x="210" y="105"></point>
+        <point x="193" y="99"></point>
+        <point x="201" y="83"></point>
+      </polygon>
+    </shape>
+    <shape name="square" rotatable="false" editableColorIndex="0">
+      <rectangle endX="270" startY="30" marked="true" color="-1920102913" endY="270" startX="30" filled="true"></rectangle>
+    </shape>
+    <shape name="square 2" rotatable="false" editableColorIndex="0">
+      <rectangle endX="270" startY="30" marked="true" color="-1920102913" endY="270" startX="30" filled="true"></rectangle>
+      <rectangle endX="240" startY="60" marked="false" color="255" endY="240" startX="60" filled="true"></rectangle>
+    </shape>
+    <shape name="star" rotatable="false" editableColorIndex="0">
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="151" y="1"></point>
+        <point x="185" y="108"></point>
+        <point x="298" y="108"></point>
+        <point x="207" y="175"></point>
+        <point x="242" y="282"></point>
+        <point x="151" y="216"></point>
+        <point x="59" y="282"></point>
+        <point x="94" y="175"></point>
+        <point x="3" y="108"></point>
+        <point x="116" y="108"></point>
+      </polygon>
+    </shape>
+    <shape name="target" rotatable="false" editableColorIndex="0">
+      <circle x="0" y="0" marked="true" color="-1920102913" diameter="300" filled="true"></circle>
+      <circle x="30" y="30" marked="false" color="255" diameter="240" filled="true"></circle>
+      <circle x="60" y="60" marked="true" color="-1920102913" diameter="180" filled="true"></circle>
+      <circle x="90" y="90" marked="false" color="255" diameter="120" filled="true"></circle>
+      <circle x="120" y="120" marked="true" color="-1920102913" diameter="60" filled="true"></circle>
+    </shape>
+    <shape name="tree" rotatable="false" editableColorIndex="0">
+      <circle x="118" y="3" marked="true" color="-1920102913" diameter="94" filled="true"></circle>
+      <rectangle endX="180" startY="195" marked="false" color="-1653716737" endY="300" startX="120" filled="true"></rectangle>
+      <circle x="65" y="21" marked="true" color="-1920102913" diameter="108" filled="true"></circle>
+      <circle x="116" y="41" marked="true" color="-1920102913" diameter="127" filled="true"></circle>
+      <circle x="45" y="90" marked="true" color="-1920102913" diameter="120" filled="true"></circle>
+      <circle x="104" y="74" marked="true" color="-1920102913" diameter="152" filled="true"></circle>
+    </shape>
+    <shape name="triangle" rotatable="false" editableColorIndex="0">
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="150" y="30"></point>
+        <point x="15" y="255"></point>
+        <point x="285" y="255"></point>
+      </polygon>
+    </shape>
+    <shape name="triangle 2" rotatable="false" editableColorIndex="0">
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="150" y="30"></point>
+        <point x="15" y="255"></point>
+        <point x="285" y="255"></point>
+      </polygon>
+      <polygon color="255" filled="true" marked="false">
+        <point x="151" y="99"></point>
+        <point x="225" y="223"></point>
+        <point x="75" y="224"></point>
+      </polygon>
+    </shape>
+    <shape name="truck" rotatable="false" editableColorIndex="0">
+      <rectangle endX="195" startY="45" marked="true" color="-1920102913" endY="187" startX="4" filled="true"></rectangle>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="296" y="193"></point>
+        <point x="296" y="150"></point>
+        <point x="259" y="134"></point>
+        <point x="244" y="104"></point>
+        <point x="208" y="104"></point>
+        <point x="207" y="194"></point>
+      </polygon>
+      <rectangle endX="195" startY="60" marked="false" color="-1" endY="105" startX="195" filled="true"></rectangle>
+      <polygon color="255" filled="true" marked="false">
+        <point x="238" y="112"></point>
+        <point x="252" y="141"></point>
+        <point x="219" y="141"></point>
+        <point x="218" y="112"></point>
+      </polygon>
+      <circle x="234" y="174" marked="false" color="255" diameter="42" filled="true"></circle>
+      <rectangle endX="214" startY="185" marked="true" color="-1920102913" endY="194" startX="181" filled="true"></rectangle>
+      <circle x="144" y="174" marked="false" color="255" diameter="42" filled="true"></circle>
+      <circle x="24" y="174" marked="false" color="255" diameter="42" filled="true"></circle>
+      <circle x="24" y="174" marked="true" color="-1920102913" diameter="42" filled="false"></circle>
+      <circle x="144" y="174" marked="true" color="-1920102913" diameter="42" filled="false"></circle>
+      <circle x="234" y="174" marked="true" color="-1920102913" diameter="42" filled="false"></circle>
+    </shape>
+    <shape name="turtle" rotatable="true" editableColorIndex="0">
+      <polygon color="1504722175" filled="true" marked="false">
+        <point x="215" y="204"></point>
+        <point x="240" y="233"></point>
+        <point x="246" y="254"></point>
+        <point x="228" y="266"></point>
+        <point x="215" y="252"></point>
+        <point x="193" y="210"></point>
+      </polygon>
+      <polygon color="1504722175" filled="true" marked="false">
+        <point x="195" y="90"></point>
+        <point x="225" y="75"></point>
+        <point x="245" y="75"></point>
+        <point x="260" y="89"></point>
+        <point x="269" y="108"></point>
+        <point x="261" y="124"></point>
+        <point x="240" y="105"></point>
+        <point x="225" y="105"></point>
+        <point x="210" y="105"></point>
+      </polygon>
+      <polygon color="1504722175" filled="true" marked="false">
+        <point x="105" y="90"></point>
+        <point x="75" y="75"></point>
+        <point x="55" y="75"></point>
+        <point x="40" y="89"></point>
+        <point x="31" y="108"></point>
+        <point x="39" y="124"></point>
+        <point x="60" y="105"></point>
+        <point x="75" y="105"></point>
+        <point x="90" y="105"></point>
+      </polygon>
+      <polygon color="1504722175" filled="true" marked="false">
+        <point x="132" y="85"></point>
+        <point x="134" y="64"></point>
+        <point x="107" y="51"></point>
+        <point x="108" y="17"></point>
+        <point x="150" y="2"></point>
+        <point x="192" y="18"></point>
+        <point x="192" y="52"></point>
+        <point x="169" y="65"></point>
+        <point x="172" y="87"></point>
+      </polygon>
+      <polygon color="1504722175" filled="true" marked="false">
+        <point x="85" y="204"></point>
+        <point x="60" y="233"></point>
+        <point x="54" y="254"></point>
+        <point x="72" y="266"></point>
+        <point x="85" y="252"></point>
+        <point x="107" y="210"></point>
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="119" y="75"></point>
+        <point x="179" y="75"></point>
+        <point x="209" y="101"></point>
+        <point x="224" y="135"></point>
+        <point x="220" y="225"></point>
+        <point x="175" y="261"></point>
+        <point x="128" y="261"></point>
+        <point x="81" y="224"></point>
+        <point x="74" y="135"></point>
+        <point x="88" y="99"></point>
+      </polygon>
+    </shape>
+    <shape name="wheel" rotatable="false" editableColorIndex="0">
+      <circle x="3" y="3" marked="true" color="-1920102913" diameter="294" filled="true"></circle>
+      <circle x="30" y="30" marked="false" color="255" diameter="240" filled="true"></circle>
+      <line endX="150" startY="285" marked="true" color="-1920102913" endY="15" startX="150"></line>
+      <line endX="285" startY="150" marked="true" color="-1920102913" endY="150" startX="15"></line>
+      <circle x="120" y="120" marked="true" color="-1920102913" diameter="60" filled="true"></circle>
+      <line endX="79" startY="40" marked="true" color="-1920102913" endY="269" startX="216"></line>
+      <line endX="269" startY="84" marked="true" color="-1920102913" endY="221" startX="40"></line>
+      <line endX="269" startY="216" marked="true" color="-1920102913" endY="79" startX="40"></line>
+      <line endX="221" startY="40" marked="true" color="-1920102913" endY="269" startX="84"></line>
+    </shape>
+    <shape name="wolf" rotatable="false" editableColorIndex="0">
+      <polygon color="255" filled="true" marked="false">
+        <point x="253" y="133"></point>
+        <point x="245" y="131"></point>
+        <point x="245" y="133"></point>
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="2" y="194"></point>
+        <point x="13" y="197"></point>
+        <point x="30" y="191"></point>
+        <point x="38" y="193"></point>
+        <point x="38" y="205"></point>
+        <point x="20" y="226"></point>
+        <point x="20" y="257"></point>
+        <point x="27" y="265"></point>
+        <point x="38" y="266"></point>
+        <point x="40" y="260"></point>
+        <point x="31" y="253"></point>
+        <point x="31" y="230"></point>
+        <point x="60" y="206"></point>
+        <point x="68" y="198"></point>
+        <point x="75" y="209"></point>
+        <point x="66" y="228"></point>
+        <point x="65" y="243"></point>
+        <point x="82" y="261"></point>
+        <point x="84" y="268"></point>
+        <point x="100" y="267"></point>
+        <point x="103" y="261"></point>
+        <point x="77" y="239"></point>
+        <point x="79" y="231"></point>
+        <point x="100" y="207"></point>
+        <point x="98" y="196"></point>
+        <point x="119" y="201"></point>
+        <point x="143" y="202"></point>
+        <point x="160" y="195"></point>
+        <point x="166" y="210"></point>
+        <point x="172" y="213"></point>
+        <point x="173" y="238"></point>
+        <point x="167" y="251"></point>
+        <point x="160" y="248"></point>
+        <point x="154" y="265"></point>
+        <point x="169" y="264"></point>
+        <point x="178" y="247"></point>
+        <point x="186" y="240"></point>
+        <point x="198" y="260"></point>
+        <point x="200" y="271"></point>
+        <point x="217" y="271"></point>
+        <point x="219" y="262"></point>
+        <point x="207" y="258"></point>
+        <point x="195" y="230"></point>
+        <point x="192" y="198"></point>
+        <point x="210" y="184"></point>
+        <point x="227" y="164"></point>
+        <point x="242" y="144"></point>
+        <point x="259" y="145"></point>
+        <point x="284" y="151"></point>
+        <point x="277" y="141"></point>
+        <point x="293" y="140"></point>
+        <point x="299" y="134"></point>
+        <point x="297" y="127"></point>
+        <point x="273" y="119"></point>
+        <point x="270" y="105"></point>
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="-1" y="195"></point>
+        <point x="14" y="180"></point>
+        <point x="36" y="166"></point>
+        <point x="40" y="153"></point>
+        <point x="53" y="140"></point>
+        <point x="82" y="131"></point>
+        <point x="134" y="133"></point>
+        <point x="159" y="126"></point>
+        <point x="188" y="115"></point>
+        <point x="227" y="108"></point>
+        <point x="236" y="102"></point>
+        <point x="238" y="98"></point>
+        <point x="268" y="86"></point>
+        <point x="269" y="92"></point>
+        <point x="281" y="87"></point>
+        <point x="269" y="103"></point>
+        <point x="269" y="113"></point>
+      </polygon>
+    </shape>
+    <shape name="x" rotatable="false" editableColorIndex="0">
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="270" y="75"></point>
+        <point x="225" y="30"></point>
+        <point x="30" y="225"></point>
+        <point x="75" y="270"></point>
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="30" y="75"></point>
+        <point x="75" y="30"></point>
+        <point x="270" y="225"></point>
+        <point x="225" y="270"></point>
+      </polygon>
+    </shape>
+  </turtleShapes>
+  <linkShapes>
+    <shape name="default" curviness="0.0">
+      <lines>
+        <line x="-0.2" visible="false">
+          <dash value="0.0"></dash>
+          <dash value="1.0"></dash>
+        </line>
+        <line x="0.0" visible="true">
+          <dash value="1.0"></dash>
+          <dash value="0.0"></dash>
+        </line>
+        <line x="0.2" visible="false">
+          <dash value="0.0"></dash>
+          <dash value="1.0"></dash>
+        </line>
+      </lines>
+      <indicator>
+        <shape name="link direction" rotatable="true" editableColorIndex="0">
+          <line endX="90" startY="150" marked="true" color="-1920102913" endY="180" startX="150"></line>
+          <line endX="210" startY="150" marked="true" color="-1920102913" endY="180" startX="150"></line>
+        </shape>
+      </indicator>
+    </shape>
+  </linkShapes>
+  <previewCommands>setup repeat 75 [ go ]</previewCommands>
+  <experiments>
+    <experiment name="E1 amplification - does talk raise the program lift" repetitions="20" sequentialRunOrder="true" runMetricsEveryStep="false">
+      <setup>random-seed behaviorspace-run-number
+setup</setup>
+      <go>go</go>
+      <exitCondition>simulation-finished?</exitCondition>
+      <metrics>
+        <metric>brand-share "baseline"</metric>
+        <metric>brand-share "campaign"</metric>
+        <metric>brand-share "pause"</metric>
+        <metric>brand-share "final"</metric>
+        <metric>program-lift</metric>
+        <metric>persistence-index</metric>
+        <metric>retention-ratio</metric>
+        <metric>withdrawal-drop</metric>
+        <metric>ticks-above-baseline</metric>
+        <metric>ticks-to-collapse</metric>
+        <metric>mean-habit</metric>
+        <metric>habit-spread</metric>
+        <metric>mean-motivation</metric>
+        <metric>motivation-loss</metric>
+        <metric>mean-satisfaction</metric>
+        <metric>share-recommending</metric>
+        <metric>share-advising-against</metric>
+        <metric>share-satisfied</metric>
+        <metric>share-dissatisfied</metric>
+        <metric>share-reached</metric>
+        <metric>mean-network-degree</metric>
+      </metrics>
+      <constants>
+        <enumeratedValueSet variable="number-of-shoppers">
+          <value value="800"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="reward-cycles">
+          <value value="2"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="program-on?">
+          <value value="true"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="reward-salience">
+          <value value="0.75"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="wom-on?">
+          <value value="false"></value>
+          <value value="true"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="talk-activity">
+          <value value="0.5"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="contagion-rule">
+          <value value="&quot;simple&quot;"></value>
+          <value value="&quot;threshold&quot;"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="adoption-threshold">
+          <value value="0.15"></value>
+          <value value="0.35"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="talk-strength">
+          <value value="0.5"></value>
+          <value value="1.5"></value>
+          <value value="3.0"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="network-topology">
+          <value value="&quot;small-world&quot;"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="rewiring-probability">
+          <value value="0.05"></value>
+          <value value="0.3"></value>
+        </enumeratedValueSet>
+      </constants>
+    </experiment>
+    <experiment name="E2 persistence - does talk hold the habit up after cancellation" repetitions="30" sequentialRunOrder="true" runMetricsEveryStep="false">
+      <setup>random-seed behaviorspace-run-number
+setup</setup>
+      <go>go</go>
+      <exitCondition>simulation-finished?</exitCondition>
+      <metrics>
+        <metric>brand-share "baseline"</metric>
+        <metric>brand-share "campaign"</metric>
+        <metric>brand-share "pause"</metric>
+        <metric>brand-share "final"</metric>
+        <metric>program-lift</metric>
+        <metric>persistence-index</metric>
+        <metric>retention-ratio</metric>
+        <metric>withdrawal-drop</metric>
+        <metric>ticks-above-baseline</metric>
+        <metric>ticks-to-collapse</metric>
+        <metric>mean-habit</metric>
+        <metric>habit-spread</metric>
+        <metric>mean-motivation</metric>
+        <metric>motivation-loss</metric>
+        <metric>mean-satisfaction</metric>
+        <metric>share-recommending</metric>
+        <metric>share-advising-against</metric>
+        <metric>share-satisfied</metric>
+        <metric>share-dissatisfied</metric>
+        <metric>share-reached</metric>
+        <metric>mean-network-degree</metric>
+      </metrics>
+      <constants>
+        <enumeratedValueSet variable="number-of-shoppers">
+          <value value="800"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="reward-cycles">
+          <value value="2"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="program-on?">
+          <value value="true"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="reward-salience">
+          <value value="0.75"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="wom-on?">
+          <value value="false"></value>
+          <value value="true"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="talk-activity">
+          <value value="0.5"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="contagion-rule">
+          <value value="&quot;simple&quot;"></value>
+          <value value="&quot;threshold&quot;"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="adoption-threshold">
+          <value value="0.15"></value>
+          <value value="0.35"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="talk-strength">
+          <value value="0.5"></value>
+          <value value="1.5"></value>
+          <value value="3.0"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="network-topology">
+          <value value="&quot;small-world&quot;"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="rewiring-probability">
+          <value value="0.05"></value>
+          <value value="0.3"></value>
+        </enumeratedValueSet>
+      </constants>
+    </experiment>
+    <experiment name="E2b persistence trajectory - four curves per tick" repetitions="5" sequentialRunOrder="true" runMetricsEveryStep="true">
+      <setup>random-seed behaviorspace-run-number
+setup</setup>
+      <go>go</go>
+      <exitCondition>simulation-finished?</exitCondition>
+      <metrics>
+        <metric>current-phase</metric>
+        <metric>current-brand-share</metric>
+        <metric>mean-habit</metric>
+        <metric>mean-motivation</metric>
+        <metric>mean-satisfaction</metric>
+        <metric>share-recommending</metric>
+        <metric>share-advising-against</metric>
+        <metric>share-reached</metric>
+      </metrics>
+      <constants>
+        <enumeratedValueSet variable="number-of-shoppers">
+          <value value="800"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="reward-cycles">
+          <value value="2"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="program-on?">
+          <value value="true"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="reward-salience">
+          <value value="0.75"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="wom-on?">
+          <value value="false"></value>
+          <value value="true"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="talk-activity">
+          <value value="0.5"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="contagion-rule">
+          <value value="&quot;simple&quot;"></value>
+          <value value="&quot;threshold&quot;"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="adoption-threshold">
+          <value value="0.25"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="talk-strength">
+          <value value="3.0"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="network-topology">
+          <value value="&quot;small-world&quot;"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="rewiring-probability">
+          <value value="0.1"></value>
+        </enumeratedValueSet>
+      </constants>
+    </experiment>
+    <experiment name="E3 substitution - program on-off crossed with talk on-off" repetitions="30" sequentialRunOrder="true" runMetricsEveryStep="false">
+      <setup>random-seed behaviorspace-run-number
+setup</setup>
+      <go>go</go>
+      <exitCondition>simulation-finished?</exitCondition>
+      <metrics>
+        <metric>brand-share "baseline"</metric>
+        <metric>brand-share "campaign"</metric>
+        <metric>brand-share "pause"</metric>
+        <metric>brand-share "final"</metric>
+        <metric>program-lift</metric>
+        <metric>persistence-index</metric>
+        <metric>retention-ratio</metric>
+        <metric>withdrawal-drop</metric>
+        <metric>ticks-above-baseline</metric>
+        <metric>ticks-to-collapse</metric>
+        <metric>mean-habit</metric>
+        <metric>habit-spread</metric>
+        <metric>mean-motivation</metric>
+        <metric>motivation-loss</metric>
+        <metric>mean-satisfaction</metric>
+        <metric>share-recommending</metric>
+        <metric>share-advising-against</metric>
+        <metric>share-satisfied</metric>
+        <metric>share-dissatisfied</metric>
+        <metric>share-reached</metric>
+        <metric>mean-network-degree</metric>
+      </metrics>
+      <constants>
+        <enumeratedValueSet variable="number-of-shoppers">
+          <value value="800"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="reward-cycles">
+          <value value="2"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="program-on?">
+          <value value="false"></value>
+          <value value="true"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="reward-salience">
+          <value value="0.75"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="wom-on?">
+          <value value="false"></value>
+          <value value="true"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="talk-activity">
+          <value value="0.5"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="contagion-rule">
+          <value value="&quot;simple&quot;"></value>
+          <value value="&quot;threshold&quot;"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="adoption-threshold">
+          <value value="0.25"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="talk-strength">
+          <value value="1.5"></value>
+          <value value="3.0"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="network-topology">
+          <value value="&quot;small-world&quot;"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="rewiring-probability">
+          <value value="0.1"></value>
+        </enumeratedValueSet>
+      </constants>
+    </experiment>
+    <experiment name="S1 network sensitivity - topology, rewiring, activity" repetitions="20" sequentialRunOrder="true" runMetricsEveryStep="false">
+      <setup>random-seed behaviorspace-run-number
+setup</setup>
+      <go>go</go>
+      <exitCondition>simulation-finished?</exitCondition>
+      <metrics>
+        <metric>brand-share "baseline"</metric>
+        <metric>brand-share "campaign"</metric>
+        <metric>brand-share "pause"</metric>
+        <metric>brand-share "final"</metric>
+        <metric>program-lift</metric>
+        <metric>persistence-index</metric>
+        <metric>retention-ratio</metric>
+        <metric>withdrawal-drop</metric>
+        <metric>ticks-above-baseline</metric>
+        <metric>ticks-to-collapse</metric>
+        <metric>mean-habit</metric>
+        <metric>habit-spread</metric>
+        <metric>mean-motivation</metric>
+        <metric>motivation-loss</metric>
+        <metric>mean-satisfaction</metric>
+        <metric>share-recommending</metric>
+        <metric>share-advising-against</metric>
+        <metric>share-satisfied</metric>
+        <metric>share-dissatisfied</metric>
+        <metric>share-reached</metric>
+        <metric>mean-network-degree</metric>
+      </metrics>
+      <constants>
+        <enumeratedValueSet variable="number-of-shoppers">
+          <value value="800"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="reward-cycles">
+          <value value="2"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="program-on?">
+          <value value="true"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="reward-salience">
+          <value value="0.75"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="wom-on?">
+          <value value="true"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="talk-activity">
+          <value value="0.2"></value>
+          <value value="0.5"></value>
+          <value value="0.8"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="contagion-rule">
+          <value value="&quot;simple&quot;"></value>
+          <value value="&quot;threshold&quot;"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="adoption-threshold">
+          <value value="0.25"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="talk-strength">
+          <value value="1.5"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="network-topology">
+          <value value="&quot;small-world&quot;"></value>
+          <value value="&quot;preferential-attachment&quot;"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="rewiring-probability">
+          <value value="0.01"></value>
+          <value value="0.1"></value>
+          <value value="0.5"></value>
+        </enumeratedValueSet>
+      </constants>
+    </experiment>
+    <experiment name="S2 crowding out - reward salience sweep" repetitions="20" sequentialRunOrder="true" runMetricsEveryStep="false">
+      <setup>random-seed behaviorspace-run-number
+setup</setup>
+      <go>go</go>
+      <exitCondition>simulation-finished?</exitCondition>
+      <metrics>
+        <metric>brand-share "baseline"</metric>
+        <metric>brand-share "campaign"</metric>
+        <metric>brand-share "pause"</metric>
+        <metric>brand-share "final"</metric>
+        <metric>program-lift</metric>
+        <metric>persistence-index</metric>
+        <metric>retention-ratio</metric>
+        <metric>withdrawal-drop</metric>
+        <metric>ticks-above-baseline</metric>
+        <metric>ticks-to-collapse</metric>
+        <metric>mean-habit</metric>
+        <metric>habit-spread</metric>
+        <metric>mean-motivation</metric>
+        <metric>motivation-loss</metric>
+        <metric>mean-satisfaction</metric>
+        <metric>share-recommending</metric>
+        <metric>share-advising-against</metric>
+        <metric>share-satisfied</metric>
+        <metric>share-dissatisfied</metric>
+        <metric>share-reached</metric>
+        <metric>mean-network-degree</metric>
+      </metrics>
+      <constants>
+        <enumeratedValueSet variable="number-of-shoppers">
+          <value value="800"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="reward-cycles">
+          <value value="2"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="program-on?">
+          <value value="true"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="reward-salience">
+          <value value="0.2"></value>
+          <value value="0.4"></value>
+          <value value="0.6"></value>
+          <value value="0.8"></value>
+          <value value="0.95"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="wom-on?">
+          <value value="false"></value>
+          <value value="true"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="talk-activity">
+          <value value="0.5"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="contagion-rule">
+          <value value="&quot;simple&quot;"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="adoption-threshold">
+          <value value="0.25"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="talk-strength">
+          <value value="1.5"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="network-topology">
+          <value value="&quot;small-world&quot;"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="rewiring-probability">
+          <value value="0.1"></value>
+        </enumeratedValueSet>
+      </constants>
+    </experiment>
+    <experiment name="regression test - small and quick" repetitions="3" sequentialRunOrder="true" runMetricsEveryStep="false">
+      <setup>random-seed behaviorspace-run-number
+setup</setup>
+      <go>go</go>
+      <exitCondition>simulation-finished?</exitCondition>
+      <metrics>
+        <metric>brand-share "baseline"</metric>
+        <metric>brand-share "campaign"</metric>
+        <metric>brand-share "pause"</metric>
+        <metric>brand-share "final"</metric>
+        <metric>program-lift</metric>
+        <metric>persistence-index</metric>
+        <metric>retention-ratio</metric>
+        <metric>withdrawal-drop</metric>
+        <metric>ticks-above-baseline</metric>
+        <metric>ticks-to-collapse</metric>
+        <metric>mean-habit</metric>
+        <metric>habit-spread</metric>
+        <metric>mean-motivation</metric>
+        <metric>motivation-loss</metric>
+        <metric>mean-satisfaction</metric>
+        <metric>share-recommending</metric>
+        <metric>share-advising-against</metric>
+        <metric>share-satisfied</metric>
+        <metric>share-dissatisfied</metric>
+        <metric>share-reached</metric>
+        <metric>mean-network-degree</metric>
+      </metrics>
+      <constants>
+        <enumeratedValueSet variable="number-of-shoppers">
+          <value value="200"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="reward-cycles">
+          <value value="2"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="program-on?">
+          <value value="false"></value>
+          <value value="true"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="reward-salience">
+          <value value="0.75"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="wom-on?">
+          <value value="false"></value>
+          <value value="true"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="talk-activity">
+          <value value="0.5"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="contagion-rule">
+          <value value="&quot;simple&quot;"></value>
+          <value value="&quot;threshold&quot;"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="adoption-threshold">
+          <value value="0.25"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="talk-strength">
+          <value value="1.5"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="network-topology">
+          <value value="&quot;small-world&quot;"></value>
+          <value value="&quot;preferential-attachment&quot;"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="rewiring-probability">
+          <value value="0.1"></value>
+        </enumeratedValueSet>
+      </constants>
+    </experiment>
+  </experiments>
+</model>
